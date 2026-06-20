@@ -24,6 +24,7 @@ PROFIT_TRAIL = 0.12                                 # 移动止盈触发浮盈
 # --- 135战法参数 ---
 ANT_LOOKBACK = 8                                    # 蚂蚁上树: 价格贴均线上爬的回溯天数
 ANT_ABOVE_RATIO = 0.7                               # 蚂蚁上树: 近N日收盘站上EMA13的比例门槛
+ANT_MAX_POS = 60                                    # 蚂蚁上树: 月线位置%上限, 超过视为高位追涨, 不算蚂蚁上树
 STICK_THRESHOLD = 0.015                             # 粘合共振: 三线最大间距/价 < 此值视为粘合
 STICK_WINDOW = 10                                   # 粘合共振: 回溯N日内是否出现过粘合
 STICK_BREAK = 0.005                                 # 粘合共振: 突破粘合带的缓冲幅度
@@ -196,8 +197,14 @@ def analyze_one(code: str, name: str, df_daily: pd.DataFrame, market_state: str)
     # --- 周线点头(135蚂蚁上树升级条件): 周线闸过 且 周EMA13本周仍在上行 ---
     week_nod = week_gate_ok and last_w[f"ema{EMA_FAST}"] > w.iloc[-2][f"ema{EMA_FAST}"]
 
+    # --- 位置高低: 价格在月线区间的百分位 (越高越贵) ---
+    m_high = m["high"].max(); m_low = m["low"].min()
+    pos_pct = (price - m_low) / (m_high - m_low) * 100 if m_high > m_low else 50
+
     # --- 135战法信号 ---
-    ant_climb = detect_ant_climb(d)
+    # 蚂蚁上树是"低位转强"形态: 形态成立 且 月线位置不高(<=ANT_MAX_POS)才算; 高位多头延续不算蚂蚁上树
+    ant_shape = detect_ant_climb(d)
+    ant_climb = ant_shape and pos_pct <= ANT_MAX_POS
     is_stick, stick_dir, stick_spread = detect_stick(d)
 
     # --- 综合分类 ---
@@ -234,13 +241,14 @@ def analyze_one(code: str, name: str, df_daily: pd.DataFrame, market_state: str)
             category = "观望-待周线点头"
             verdict = f"蚂蚁上树转强但周线未点头(打分{score}), 有仓可持/无仓观望"
     elif day_state == "多头排列":
-        category = "持有/观察"; verdict = f"多头排列但无新信号(打分{score}), 持有不追"
+        category = "持有/观察"
+        if ant_shape:   # 形态像蚂蚁上树, 但已在高位, 不算转强买点
+            verdict = (f"蚂蚁上树形态但已高位(月线{pos_pct:.0f}%>{ANT_MAX_POS}%), "
+                       f"属高位多头延续, 不追/持有为主(打分{score})")
+        else:
+            verdict = f"多头排列但无新信号(打分{score}), 持有不追"
     else:
         category = "观望"; verdict = f"信号不足(打分{score})"
-
-    # --- 位置高低: 价格在月线区间的百分位 ---
-    m_high = m["high"].max(); m_low = m["low"].min()
-    pos_pct = (price - m_low) / (m_high - m_low) * 100 if m_high > m_low else 50
 
     return {
         "code": code, "name": name, "price": round(price, 3),
