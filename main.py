@@ -130,9 +130,19 @@ def main():
 
     stamp = datetime.now().strftime("%Y%m%d")
     out_html = ROOT / f"report_{stamp}.html"
+    # 先记快照(让本次运行也进入报告的历史时间线), 再出报告
+    snap_ts = None
+    try:
+        from history import record_snapshot
+        snap_ts = record_snapshot(results, market)
+    except Exception as e:
+        print(f"[快照失败] {e}")
+
     n, nf, ne = build_reports(results, market, out_html)
     print(f"\n完成! 有效{n}只, 可关注{nf}只, 失败{ne}只")
     print(f"报告: {out_html}")
+    if snap_ts:
+        print(f"已存快照: {snap_ts}")
 
     # 自动发布到公开 GitHub Pages 仓库 (见 push.py); 未配置或失败都不影响扫描结果
     try:

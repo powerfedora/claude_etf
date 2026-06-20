@@ -106,6 +106,54 @@ def build_portfolio_panel(rows):
     </div>"""
 
 
+def build_history_panel():
+    """渲染"操作记录"(trades) 与 "近期运行"(snapshots 时间线) 两块面板。"""
+    try:
+        from history import load_trades, load_snapshots
+    except Exception:
+        return ""
+
+    trades = load_trades()
+    snaps = load_snapshots()
+    if not trades and not snaps:
+        return ""
+
+    out = ""
+    # 操作记录
+    if trades:
+        rows = ""
+        for t in reversed(trades[-20:]):
+            act = t.get("action")
+            color = "#e53935" if act == "sell" else "#43a047"
+            label = "卖出" if act == "sell" else "买入"
+            rows += (f'<tr><td style="font-size:12px">{t["ts"]}</td>'
+                     f'<td><b>{t.get("name","")}</b> <span class="code">{t["code"]}</span></td>'
+                     f'<td style="color:{color};font-weight:600">{label}</td>'
+                     f'<td>{_wan(t["amount"])}</td><td>{t["price"]}</td>'
+                     f'<td>{_wan(t.get("after_filled",0))}/{t.get("after_cost",0)}</td>'
+                     f'<td style="font-size:12px;color:#888">{t.get("note","")}</td></tr>')
+        out += f"""<div class="focusbox">
+          <h2>📜 操作记录 ({len(trades)} 笔)</h2>
+          <table><tr><th>时间</th><th>标的</th><th>方向</th><th>金额</th><th>成交价</th><th>后:已建仓/均价</th><th>备注</th></tr>
+          {rows}</table></div>"""
+
+    # 近期运行时间线
+    if snaps:
+        rows = ""
+        for s in reversed(snaps[-12:]):
+            pf = s.get("portfolio") or {}
+            focus = sum(1 for e in s["etfs"] if e["cat"].startswith("可关注"))
+            rows += (f'<tr><td style="font-size:12px">{s["ts"]}</td>'
+                     f'<td>{s["market"]}</td><td>{focus} 只</td>'
+                     f'<td>{_wan(pf.get("filled",0))}</td><td>{_wan(pf.get("cash",0))}</td></tr>')
+        out += f"""<div class="focusbox">
+          <h2>🕒 近期运行 ({len(snaps)} 次快照)</h2>
+          <table><tr><th>时间</th><th>大盘</th><th>可关注</th><th>已投</th><th>现金</th></tr>
+          {rows}</table>
+          <div style="font-size:11px;color:#aaa;margin-top:8px">完整历史在 history/ 目录; 查询某只变化: <code>python history.py code 代码</code></div></div>"""
+    return out
+
+
 def build_reports(results, market_state, out_html):
     rows = [r for r in results if not r.get("error")]
     errs = [r for r in results if r.get("error")]
@@ -135,6 +183,7 @@ def build_reports(results, market_state, out_html):
     ) or '<span style="color:#999">本次无达标(≥4分且有信号)标的</span>'
 
     portfolio_panel = build_portfolio_panel(rows)
+    history_panel = build_history_panel()
 
     html = f"""<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -170,6 +219,7 @@ def build_reports(results, market_state, out_html):
   {focus_html}
 </div>
 {portfolio_panel}
+{history_panel}
 <table>
   <tr><th>标的</th><th>现价</th><th>分类/打分</th><th>月/周/日</th><th>月线位置</th><th>结论 / 触发信号</th></tr>
   {cards}
