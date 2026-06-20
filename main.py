@@ -130,10 +130,18 @@ def main():
 
     stamp = datetime.now().strftime("%Y%m%d")
     out_html = ROOT / f"report_{stamp}.html"
-    out_xlsx = ROOT / f"report_{stamp}.xlsx"
-    n, nf, ne = build_reports(results, market, out_html, out_xlsx)
+    n, nf, ne = build_reports(results, market, out_html)
     print(f"\n完成! 有效{n}只, 可关注{nf}只, 失败{ne}只")
-    print(f"报告: {out_html}  /  {out_xlsx}")
+    print(f"报告: {out_html}")
+
+    # 自动发布到公开 GitHub Pages 仓库 (见 push.py); 未配置或失败都不影响扫描结果
+    try:
+        from push import publish_latest
+        publish_latest()
+    except SystemExit as e:
+        print(f"[发布跳过] {e}")
+    except Exception as e:
+        print(f"[发布失败] {e}")
 
 
 if __name__ == "__main__":

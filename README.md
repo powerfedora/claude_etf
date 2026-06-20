@@ -53,11 +53,18 @@ pip install pandas numpy openpyxl requests
 python main.py
 ```
 
-跑完会在当前目录生成两个文件：
-- `report_日期.html` —— 看这个。手机/电脑浏览器打开，置顶排序、可关注标红
-- `report_日期.xlsx` —— Excel 版，方便你自己筛选排序
+跑完会在当前目录生成报告：
+- `report_日期.html` —— 手机/电脑浏览器打开，置顶排序、可关注标红
 
 以后每个交易日收盘后（或周末）跑一次即可。
+
+### 自动发布到网页（可选）
+
+配置好 `push.py` 后，`main.py` 跑完会自动把最新 HTML 推送到一个**公开**的 GitHub Pages 仓库，
+你就能用手机随时打开 `https://<用户名>.github.io/<仓库名>/` 看最新报告。
+配置步骤见 `push.py` 文件顶部注释。也可单独运行 `python push.py` 手动发布。
+
+> ⚠️ Pages 仓库是**公开**的，任何人拿到链接都能看，不要把隐私信息写进报告。
 
 ---
 

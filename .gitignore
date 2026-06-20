@@ -5,6 +5,9 @@ tushare_mcp.json
 report_*.html
 report_*.xlsx
 
+# push.py 发布时本地克隆的 Pages 仓库工作副本
+.pages_publish/
+
 # Python
 __pycache__/
 *.py[cod]

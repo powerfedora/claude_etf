@@ -1,7 +1,6 @@
 """
-报告生成: 把所有ETF分析结果汇总成 HTML + Excel
+报告生成: 把所有ETF分析结果汇总成 HTML
 """
-import pandas as pd
 from datetime import datetime
 
 # 分类排序优先级 (越上越值得看)
@@ -21,27 +20,10 @@ CAT_COLOR = {
 }
 
 
-def build_reports(results, market_state, out_html, out_xlsx):
+def build_reports(results, market_state, out_html):
     rows = [r for r in results if not r.get("error")]
     errs = [r for r in results if r.get("error")]
     rows.sort(key=lambda r: (CAT_ORDER.get(r["category"], 9), -r["score"]))
-
-    # ---------- Excel ----------
-    df = pd.DataFrame([{
-        "代码": r["code"], "名称": r["name"], "现价": r["price"],
-        "分类": r["category"], "打分": r["score"],
-        "月线": r["month_state"], "周线": r["week_state"],
-        "日线": r["day_state"], "金叉死叉": r["day_cross"],
-        "周线闸": "过" if r["week_gate_ok"] else "未过",
-        "回踩": "是" if r["is_pullback"] else "",
-        "蚂蚁上树": ("转强" if r.get("ant_climb") else "")
-                   + ("+周线点头" if r.get("ant_climb") and r.get("week_nod") else ""),
-        "粘合共振": (f"粘合·{r.get('stick_dir')}" if r.get("is_stick") else ""),
-        "放量": "是" if r["is_volume_up"] else "",
-        "张口%": r["gap_pct"], "月线位置%": r["pos_pct"],
-        "结论": r["verdict"],
-    } for r in rows])
-    df.to_excel(out_xlsx, index=False)
 
     # ---------- HTML ----------
     ts = datetime.now().strftime("%Y-%m-%d %H:%M")
