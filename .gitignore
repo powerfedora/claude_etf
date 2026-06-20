@@ -8,6 +8,9 @@ report_*.xlsx
 # push.py 发布时本地克隆的 Pages 仓库工作副本
 .pages_publish/
 
+# 定时任务(launchd)运行日志
+scan.log
+
 # Python
 __pycache__/
 *.py[cod]
