@@ -223,8 +223,19 @@ def analyze_one(code: str, name: str, df_daily: pd.DataFrame, market_state: str)
             category = "回避-向下变盘"
             verdict = f"三线粘合后向下跌破(最小间距{stick_spread}%), 向下变盘, 规避"
         elif stick_dir == "向上":
-            category = "可关注-向上变盘"
-            verdict = f"三线粘合后向上突破(最小间距{stick_spread}%, 打分{score}), 变盘向上进场候选"
+            # 改进: 粘合向上突破需 ①放量确认 ②次日确认(非首日突破)
+            prev = d.iloc[-2]
+            prev_band_top = max(prev[f"ema{EMA_FAST}"], prev[f"ema{EMA_MID}"], prev[f"ema{EMA_SLOW}"])
+            first_day_break = prev["close"] <= prev_band_top * (1 + STICK_BREAK)
+            if not is_volume_up:
+                category = "观望-变盘待确认"
+                verdict = f"三线粘合向上突破但缺量(最小间距{stick_spread}%), 等放量确认再进场"
+            elif first_day_break:
+                category = "观望-变盘待确认"
+                verdict = f"三线粘合今日首次突破(最小间距{stick_spread}%, 打分{score}), 等次日确认站稳"
+            else:
+                category = "可关注-向上变盘"
+                verdict = f"三线粘合向上突破已确认+放量(最小间距{stick_spread}%, 打分{score}), 进场候选"
         else:
             category = "观望-变盘待定"
             verdict = f"三线粘合(最小间距{stick_spread}%)变盘前兆, 方向未明先观望"
