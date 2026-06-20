@@ -293,28 +293,46 @@ def daily_signal(d_all, w_all, m_all, market_state):
 
 # ============ 回测主逻辑 ============
 
-def run_backtest(code="510210", name=None):
+def run_backtest(code="510210", name=None, idx_df=None, quiet=False):
+    """回测单只ETF。idx_df 可复用避免重复拉取; quiet=True 时只返回摘要 dict 不打印明细。"""
     ts_code = code.zfill(6)
     suffix = "SH" if ts_code.startswith(("5", "6")) else "SZ"
     full_code = f"{ts_code}.{suffix}"
     label = name or ts_code
 
-    print("=" * 60)
-    print(f"  {ts_code} {label} 策略回测")
-    print("  资金: 100万 | 回测区间: 近6个月")
-    print("=" * 60)
-
     end_date = datetime.now().strftime("%Y%m%d")
-    start_date = "20240101"  # 拉长数据用于 EMA 预热
+    start_date = "20240101"
 
-    print(f"\n拉取 {ts_code} 日线数据...")
-    etf_df = fetch_daily(full_code, start_date, end_date)
-    print(f"  共 {len(etf_df)} 条日线, {etf_df['date'].iloc[0].date()} ~ {etf_df['date'].iloc[-1].date()}")
+    if not quiet:
+        print("=" * 60)
+        print(f"  {ts_code} {label} 策略回测")
+        print("  资金: 100万 | 回测区间: 近6个月")
+        print("=" * 60)
+        print(f"\n拉取 {ts_code} 日线数据...")
 
-    time.sleep(1.5)
-    print("拉取沪深300指数数据(大盘环境)...")
-    idx_df = fetch_index("000300.SH", start_date, end_date)
-    print(f"  共 {len(idx_df)} 条日线")
+    try:
+        etf_df = fetch_daily(full_code, start_date, end_date)
+    except Exception as e:
+        if not quiet:
+            print(f"  数据获取失败: {e}")
+        return {"code": ts_code, "name": label, "error": str(e)}
+
+    if etf_df is None or len(etf_df) < 150:
+        if not quiet:
+            print(f"  数据不足({len(etf_df) if etf_df is not None else 0}条)")
+        return {"code": ts_code, "name": label, "error": "数据不足"}
+
+    if not quiet:
+        print(f"  共 {len(etf_df)} 条日线, {etf_df['date'].iloc[0].date()} ~ {etf_df['date'].iloc[-1].date()}")
+
+    if idx_df is None:
+        time.sleep(1.5)
+        if not quiet:
+            print("拉取沪深300指数数据(大盘环境)...")
+        idx_df = fetch_index("000300.SH", start_date, end_date)
+
+    if not quiet:
+        print(f"  共 {len(idx_df)} 条日线")
 
     # 回测窗口: 最近约 6 个月
     bt_start = etf_df["date"].iloc[-1] - pd.Timedelta(days=183)
@@ -324,9 +342,10 @@ def run_backtest(code="510210", name=None):
         bt_start_idx = warmup
     bt_dates = etf_df.iloc[bt_start_idx:].index.tolist()
 
-    print(f"\n回测窗口: {etf_df.loc[bt_dates[0], 'date'].date()} ~ {etf_df.loc[bt_dates[-1], 'date'].date()}")
-    print(f"回测交易日数: {len(bt_dates)}")
-    print("-" * 60)
+    if not quiet:
+        print(f"\n回测窗口: {etf_df.loc[bt_dates[0], 'date'].date()} ~ {etf_df.loc[bt_dates[-1], 'date'].date()}")
+        print(f"回测交易日数: {len(bt_dates)}")
+        print("-" * 60)
 
     # 状态
     cash = CAPITAL
@@ -439,7 +458,6 @@ def run_backtest(code="510210", name=None):
         holding = False
 
     # ============ 统计 ============
-    buys = [t for t in trades if t["type"] == "buy"]
     sells = [t for t in trades if t["type"] == "sell"]
     wins = [t for t in sells if t["pnl"] > 0]
     losses = [t for t in sells if t["pnl"] <= 0]
@@ -448,51 +466,20 @@ def run_backtest(code="510210", name=None):
     final_value = cash
     total_return = (final_value - CAPITAL) / CAPITAL * 100
 
-    print("\n" + "=" * 60)
-    print("  回测结果")
-    print("=" * 60)
-
-    print(f"\n{'初始资金':>12}: {CAPITAL:>12,.0f} 元")
-    print(f"{'期末资金':>12}: {final_value:>12,.0f} 元")
-    print(f"{'总收益':>12}: {total_pnl:>+12,.0f} 元")
-    print(f"{'总收益率':>12}: {total_return:>+11.2f}%")
-
     n_trades = len(sells)
     win_rate = len(wins) / n_trades * 100 if n_trades else 0
-    print(f"\n{'总交易轮次':>12}: {n_trades}")
-    print(f"{'盈利次数':>12}: {len(wins)}")
-    print(f"{'亏损次数':>12}: {len(losses)}")
-    print(f"{'胜率':>12}: {win_rate:.1f}%")
 
-    if wins:
-        avg_win = np.mean([t["pnl_pct"] for t in wins])
-        max_win = max(t["pnl_pct"] for t in wins)
-        print(f"{'平均盈利':>12}: +{avg_win:.2f}%")
-        print(f"{'最大单笔盈利':>12}: +{max_win:.2f}%")
-    if losses:
-        avg_loss = np.mean([t["pnl_pct"] for t in losses])
-        max_loss = min(t["pnl_pct"] for t in losses)
-        print(f"{'平均亏损':>12}: {avg_loss:.2f}%")
-        print(f"{'最大单笔亏损':>12}: {max_loss:.2f}%")
-    if wins and losses:
-        profit_loss_ratio = abs(np.mean([t["pnl_pct"] for t in wins])) / abs(np.mean([t["pnl_pct"] for t in losses]))
-        print(f"{'盈亏比':>12}: {profit_loss_ratio:.2f}")
-
-    # 持仓天数统计
     hold_days = []
     for i in range(0, len(trades) - 1, 2):
         if trades[i]["type"] == "buy" and i + 1 < len(trades) and trades[i+1]["type"] == "sell":
             bd = pd.Timestamp(trades[i]["date"])
             sd = pd.Timestamp(trades[i+1]["date"])
             hold_days.append((sd - bd).days)
-    if hold_days:
-        print(f"{'平均持仓天数':>12}: {np.mean(hold_days):.0f} 天")
 
-    # 最大回撤 (逐日净值)
+    # 最大回撤
     nav_series = []
     _cash = CAPITAL
     _shares = 0
-    _cost = 0
     trade_idx = 0
     for i_day in bt_dates:
         row = etf_df.loc[i_day]
@@ -502,7 +489,6 @@ def run_backtest(code="510210", name=None):
             t = trades[trade_idx]
             if t["type"] == "buy":
                 _shares = t["shares"]
-                _cost = t["price"]
                 _cash -= t["amount"]
             elif t["type"] == "sell":
                 _cash += t["amount"]
@@ -510,40 +496,177 @@ def run_backtest(code="510210", name=None):
             trade_idx += 1
         nav = _cash + _shares * price
         nav_series.append(nav)
-
     nav_arr = np.array(nav_series)
     peak = np.maximum.accumulate(nav_arr)
     drawdown = (nav_arr - peak) / peak
     max_dd = drawdown.min() * 100
-    print(f"{'最大回撤':>12}: {max_dd:.2f}%")
 
-    # ---- 逐笔明细 ----
-    print("\n" + "-" * 60)
-    print("  逐笔交易明细")
-    print("-" * 60)
-    for t in trades:
-        if t["type"] == "buy":
-            print(f"  买入 | {t['date']} | 价格 {t['price']:.4f} | "
-                  f"金额 {t['amount']:>10,.0f} | {t['category']}(打分{t.get('score','')}) | "
-                  f"大盘:{t['market']} | {t['reason']}")
-        else:
-            color = "盈" if t["pnl"] > 0 else "亏"
-            print(f"  卖出 | {t['date']} | 价格 {t['price']:.4f} | "
-                  f"金额 {t['amount']:>10,.0f} | {color} {t['pnl']:>+8,.0f}({t['pnl_pct']:>+.2f}%) | "
-                  f"{t['reason']}")
-    print("-" * 60)
-
-    # Buy & Hold 对比
     bh_start_price = etf_df.loc[bt_dates[0], "close"]
     bh_end_price = etf_df.loc[bt_dates[-1], "close"]
     bh_return = (bh_end_price - bh_start_price) / bh_start_price * 100
-    print(f"\n  买入持有对比: {bh_start_price:.4f} -> {bh_end_price:.4f}, 收益率 {bh_return:+.2f}%")
-    print(f"  策略 vs 买入持有: {total_return - bh_return:+.2f}% {'超额' if total_return > bh_return else '不及'}")
-    print("=" * 60)
+
+    avg_win = np.mean([t["pnl_pct"] for t in wins]) if wins else 0
+    avg_loss = np.mean([t["pnl_pct"] for t in losses]) if losses else 0
+    pl_ratio = abs(avg_win) / abs(avg_loss) if losses and avg_loss != 0 else float("inf") if wins else 0
+
+    summary = {
+        "code": ts_code, "name": label,
+        "total_return": round(total_return, 2),
+        "bh_return": round(bh_return, 2),
+        "excess": round(total_return - bh_return, 2),
+        "n_trades": n_trades,
+        "wins": len(wins), "losses": len(losses),
+        "win_rate": round(win_rate, 1),
+        "avg_win": round(avg_win, 2),
+        "avg_loss": round(avg_loss, 2),
+        "pl_ratio": round(pl_ratio, 2),
+        "max_dd": round(max_dd, 2),
+        "avg_hold_days": round(np.mean(hold_days)) if hold_days else 0,
+        "trades": trades,
+    }
+
+    if not quiet:
+        print("\n" + "=" * 60)
+        print("  回测结果")
+        print("=" * 60)
+        print(f"\n{'初始资金':>12}: {CAPITAL:>12,.0f} 元")
+        print(f"{'期末资金':>12}: {final_value:>12,.0f} 元")
+        print(f"{'总收益':>12}: {total_pnl:>+12,.0f} 元")
+        print(f"{'总收益率':>12}: {total_return:>+11.2f}%")
+        print(f"\n{'总交易轮次':>12}: {n_trades}")
+        print(f"{'盈利次数':>12}: {len(wins)}")
+        print(f"{'亏损次数':>12}: {len(losses)}")
+        print(f"{'胜率':>12}: {win_rate:.1f}%")
+        if wins:
+            print(f"{'平均盈利':>12}: +{avg_win:.2f}%")
+            print(f"{'最大单笔盈利':>12}: +{max(t['pnl_pct'] for t in wins):.2f}%")
+        if losses:
+            print(f"{'平均亏损':>12}: {avg_loss:.2f}%")
+            print(f"{'最大单笔亏损':>12}: {min(t['pnl_pct'] for t in losses):.2f}%")
+        if wins and losses:
+            print(f"{'盈亏比':>12}: {pl_ratio:.2f}")
+        if hold_days:
+            print(f"{'平均持仓天数':>12}: {np.mean(hold_days):.0f} 天")
+        print(f"{'最大回撤':>12}: {max_dd:.2f}%")
+
+        print("\n" + "-" * 60)
+        print("  逐笔交易明细")
+        print("-" * 60)
+        for t in trades:
+            if t["type"] == "buy":
+                print(f"  买入 | {t['date']} | 价格 {t['price']:.4f} | "
+                      f"金额 {t['amount']:>10,.0f} | {t['category']}(打分{t.get('score','')}) | "
+                      f"大盘:{t['market']} | {t['reason']}")
+            else:
+                color = "盈" if t["pnl"] > 0 else "亏"
+                print(f"  卖出 | {t['date']} | 价格 {t['price']:.4f} | "
+                      f"金额 {t['amount']:>10,.0f} | {color} {t['pnl']:>+8,.0f}({t['pnl_pct']:>+.2f}%) | "
+                      f"{t['reason']}")
+        print("-" * 60)
+        print(f"\n  买入持有对比: {bh_start_price:.4f} -> {bh_end_price:.4f}, 收益率 {bh_return:+.2f}%")
+        print(f"  策略 vs 买入持有: {total_return - bh_return:+.2f}% {'超额' if total_return > bh_return else '不及'}")
+        print("=" * 60)
+
+    return summary
+
+
+# ============ 批量回测 ============
+
+def run_batch():
+    """读取 etf_list.txt, 逐只回测, 输出汇总排行榜。"""
+    from pathlib import Path
+    list_file = Path(__file__).resolve().parent / "etf_list.txt"
+    codes = []
+    with open(list_file, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.replace(",", " ").split()
+            code = parts[0].zfill(6)
+            name = parts[1] if len(parts) > 1 else code
+            codes.append((code, name))
+
+    print("=" * 70)
+    print(f"  ETF 策略批量回测 | 共 {len(codes)} 只 | 资金 100万/只 | 近6个月")
+    print("=" * 70)
+
+    end_date = datetime.now().strftime("%Y%m%d")
+    start_date = "20240101"
+    print("\n拉取沪深300指数数据(大盘环境, 全局复用)...")
+    idx_df = fetch_index("000300.SH", start_date, end_date)
+    print(f"  共 {len(idx_df)} 条日线\n")
+
+    results = []
+    for i, (code, name) in enumerate(codes, 1):
+        print(f"[{i:>2}/{len(codes)}] {code} {name} ...", end=" ", flush=True)
+        try:
+            s = run_backtest(code, name, idx_df=idx_df, quiet=True)
+            if s.get("error"):
+                print(f"失败: {s['error']}")
+            else:
+                print(f"收益{s['total_return']:>+7.2f}% | 胜率{s['win_rate']:>5.1f}% | "
+                      f"{s['n_trades']}笔 | 回撤{s['max_dd']:>6.2f}% | "
+                      f"超额{s['excess']:>+7.2f}%")
+            results.append(s)
+        except Exception as e:
+            print(f"异常: {e}")
+            results.append({"code": code, "name": name, "error": str(e)})
+        time.sleep(1.5)
+
+    # ---- 汇总排行榜 ----
+    valid = [r for r in results if not r.get("error")]
+    failed = [r for r in results if r.get("error")]
+
+    print("\n" + "=" * 70)
+    print("  汇总排行榜 (按策略收益率排序)")
+    print("=" * 70)
+    print(f"{'排名':>4} {'代码':>8} {'名称':<10} {'策略收益':>8} {'买入持有':>8} {'超额':>8} "
+          f"{'胜率':>6} {'笔数':>4} {'盈亏比':>6} {'回撤':>7} {'持仓天':>6}")
+    print("-" * 100)
+
+    valid.sort(key=lambda r: r["total_return"], reverse=True)
+    for rank, r in enumerate(valid, 1):
+        print(f"{rank:>4} {r['code']:>8} {r['name']:<10} {r['total_return']:>+7.2f}% "
+              f"{r['bh_return']:>+7.2f}% {r['excess']:>+7.2f}% "
+              f"{r['win_rate']:>5.1f}% {r['n_trades']:>4} {r['pl_ratio']:>6.2f} "
+              f"{r['max_dd']:>6.2f}% {r['avg_hold_days']:>5.0f}")
+
+    # 全局统计
+    if valid:
+        avg_ret = np.mean([r["total_return"] for r in valid])
+        avg_bh = np.mean([r["bh_return"] for r in valid])
+        avg_excess = np.mean([r["excess"] for r in valid])
+        pos_count = sum(1 for r in valid if r["total_return"] > 0)
+        excess_count = sum(1 for r in valid if r["excess"] > 0)
+        all_wins = sum(r["wins"] for r in valid)
+        all_losses = sum(r["losses"] for r in valid)
+        all_trades = sum(r["n_trades"] for r in valid)
+        overall_wr = all_wins / all_trades * 100 if all_trades else 0
+        no_trade = sum(1 for r in valid if r["n_trades"] == 0)
+
+        print("-" * 100)
+        print(f"\n{'有效标的':>12}: {len(valid)} 只 (失败 {len(failed)} 只)")
+        print(f"{'平均策略收益':>12}: {avg_ret:+.2f}%")
+        print(f"{'平均买入持有':>12}: {avg_bh:+.2f}%")
+        print(f"{'平均超额收益':>12}: {avg_excess:+.2f}%")
+        print(f"{'盈利标的数':>12}: {pos_count}/{len(valid)} ({pos_count/len(valid)*100:.0f}%)")
+        print(f"{'跑赢买入持有':>12}: {excess_count}/{len(valid)} ({excess_count/len(valid)*100:.0f}%)")
+        print(f"{'总交易笔数':>12}: {all_trades} (盈{all_wins}/亏{all_losses})")
+        print(f"{'全局胜率':>12}: {overall_wr:.1f}%")
+        print(f"{'无交易标的':>12}: {no_trade} 只 (半年内无信号触发)")
+
+    if failed:
+        print(f"\n失败标的: {', '.join(r['code']+' '+r['name'] for r in failed)}")
+
+    print("=" * 70)
 
 
 if __name__ == "__main__":
     import sys
-    code = sys.argv[1] if len(sys.argv) > 1 else "510210"
-    name = sys.argv[2] if len(sys.argv) > 2 else None
-    run_backtest(code, name)
+    if len(sys.argv) > 1 and sys.argv[1] == "--batch":
+        run_batch()
+    else:
+        code = sys.argv[1] if len(sys.argv) > 1 else "510210"
+        name = sys.argv[2] if len(sys.argv) > 2 else None
+        run_backtest(code, name)
