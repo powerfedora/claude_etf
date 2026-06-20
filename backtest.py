@@ -293,8 +293,10 @@ def daily_signal(d_all, w_all, m_all, market_state):
 
 # ============ 回测主逻辑 ============
 
-def run_backtest(code="510210", name=None, idx_df=None, quiet=False):
-    """回测单只ETF。idx_df 可复用避免重复拉取; quiet=True 时只返回摘要 dict 不打印明细。"""
+STICK_COOLDOWN = 10  # 改进: 粘合止损后冷却期(交易日)
+
+def run_backtest(code="510210", name=None, idx_df=None, quiet=False, improved=False):
+    """回测单只ETF。improved=True 启用3项改进: 次日确认/放量过滤/冷却期。"""
     ts_code = code.zfill(6)
     suffix = "SH" if ts_code.startswith(("5", "6")) else "SZ"
     full_code = f"{ts_code}.{suffix}"
@@ -354,6 +356,10 @@ def run_backtest(code="510210", name=None, idx_df=None, quiet=False):
     max_profit_pct = 0.0
     trades = []
     holding = False
+    # 改进模式状态
+    pending_stick_buy = False    # 粘合突破待确认
+    stick_cooldown = 0           # 粘合止损后冷却倒计时
+    last_sell_was_stick = False   # 上次卖出是否源于粘合入场
 
     for i_day in bt_dates:
         row = etf_df.loc[i_day]
@@ -371,6 +377,37 @@ def run_backtest(code="510210", name=None, idx_df=None, quiet=False):
         market = get_market_state_at(idx_df, idx_pos) if idx_pos >= 10 else "谨慎档"
 
         cat, score, verdict = daily_signal(d_slice, w_slice, m_slice, market)
+
+        if improved and stick_cooldown > 0:
+            stick_cooldown -= 1
+
+        # ---- 改进: 粘合突破次日确认 ----
+        if improved and pending_stick_buy and not holding:
+            is_still_stick, still_dir, _ = detect_stick(d_slice)
+            ema34_now = d_slice.iloc[-1][f"ema{EMA_MID}"]
+            if price > ema34_now and (not is_still_stick or still_dir != "向下"):
+                shares = int(cash // price)
+                if shares > 0:
+                    cost_price = price
+                    buy_amount = shares * price
+                    cash -= buy_amount
+                    max_profit_pct = 0
+                    holding = True
+                    last_sell_was_stick = False
+                    trades.append({
+                        "type": "buy",
+                        "date": today.strftime("%Y-%m-%d"),
+                        "price": round(price, 4),
+                        "shares": shares,
+                        "amount": round(buy_amount, 0),
+                        "reason": "粘合突破(次日确认)",
+                        "market": market,
+                        "category": "可关注-向上变盘",
+                        "score": score,
+                    })
+            pending_stick_buy = False
+            if holding:
+                continue
 
         # ---- 持仓中: 检查卖出条件 ----
         if holding:
@@ -397,6 +434,9 @@ def run_backtest(code="510210", name=None, idx_df=None, quiet=False):
                 sell_amount = shares * price
                 pnl = sell_amount - shares * cost_price
                 cash += sell_amount
+                # 改进: 粘合入场被止损 -> 启动冷却期
+                if improved and "向上变盘" in trades[-1].get("category", ""):
+                    stick_cooldown = STICK_COOLDOWN
                 trades.append({
                     "type": "sell",
                     "date": today.strftime("%Y-%m-%d"),
@@ -416,6 +456,22 @@ def run_backtest(code="510210", name=None, idx_df=None, quiet=False):
 
         # ---- 空仓: 检查买入条件 ----
         elif not holding and cat.startswith("可关注"):
+            is_stick_signal = "向上变盘" in cat
+
+            if improved and is_stick_signal:
+                # 改进1: 冷却期内不做粘合突破
+                if stick_cooldown > 0:
+                    continue
+                # 改进2: 粘合突破必须放量
+                vol_now = d_slice.iloc[-1]["volume"]
+                vol_ma = d_slice["volume"].iloc[-VOL_LOOKBACK - 1:-1].mean()
+                if vol_now <= vol_ma:
+                    continue
+                # 改进3: 不立即买, 设为待确认, 次日再决定
+                pending_stick_buy = True
+                continue
+
+            # 非粘合信号(金叉/回踩/蚂蚁上树): 正常买入
             shares = int(cash // price)
             if shares > 0:
                 cost_price = price
@@ -662,11 +718,119 @@ def run_batch():
     print("=" * 70)
 
 
+def run_compare():
+    """原版 vs 改进版 对比回测。"""
+    from pathlib import Path
+    list_file = Path(__file__).resolve().parent / "etf_list.txt"
+    codes = []
+    with open(list_file, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.replace(",", " ").split()
+            code = parts[0].zfill(6)
+            name = parts[1] if len(parts) > 1 else code
+            codes.append((code, name))
+
+    print("=" * 90)
+    print(f"  原版 vs 改进版 对比回测 | 共 {len(codes)} 只 | 资金 100万/只 | 近6个月")
+    print("  改进项: ①粘合突破次日确认 ②突破须放量 ③止损后10日冷却")
+    print("=" * 90)
+
+    end_date = datetime.now().strftime("%Y%m%d")
+    start_date = "20240101"
+    print("\n拉取沪深300指数...")
+    idx_df = fetch_index("000300.SH", start_date, end_date)
+    print(f"  共 {len(idx_df)} 条\n")
+
+    old_results = []
+    new_results = []
+    for i, (code, name) in enumerate(codes, 1):
+        print(f"[{i:>2}/{len(codes)}] {code} {name} ...", end=" ", flush=True)
+        try:
+            s_old = run_backtest(code, name, idx_df=idx_df, quiet=True, improved=False)
+            s_new = run_backtest(code, name, idx_df=idx_df, quiet=True, improved=True)
+            old_results.append(s_old)
+            new_results.append(s_new)
+            if s_old.get("error"):
+                print(f"失败: {s_old['error']}")
+            else:
+                delta = s_new["total_return"] - s_old["total_return"]
+                print(f"原版{s_old['total_return']:>+7.2f}%({s_old['n_trades']}笔) | "
+                      f"改进{s_new['total_return']:>+7.2f}%({s_new['n_trades']}笔) | "
+                      f"差异{delta:>+6.2f}%")
+        except Exception as e:
+            print(f"异常: {e}")
+            old_results.append({"code": code, "name": name, "error": str(e)})
+            new_results.append({"code": code, "name": name, "error": str(e)})
+        time.sleep(1.5)
+
+    # ---- 对比排行榜 ----
+    valid_old = [r for r in old_results if not r.get("error")]
+    valid_new = [r for r in new_results if not r.get("error")]
+    by_code_new = {r["code"]: r for r in valid_new}
+
+    print("\n" + "=" * 90)
+    print("  对比排行榜 (按改进版收益排序)")
+    print("=" * 90)
+    print(f"{'排名':>4} {'代码':>8} {'名称':<10} {'原版收益':>8} {'原版胜率':>7} {'原笔数':>5} "
+          f"{'改进收益':>8} {'改进胜率':>7} {'改笔数':>5} {'收益变化':>8}")
+    print("-" * 105)
+
+    pairs = []
+    for r_old in valid_old:
+        r_new = by_code_new.get(r_old["code"])
+        if r_new and not r_new.get("error"):
+            pairs.append((r_old, r_new))
+    pairs.sort(key=lambda p: p[1]["total_return"], reverse=True)
+
+    improved_count = 0
+    for rank, (r_old, r_new) in enumerate(pairs, 1):
+        delta = r_new["total_return"] - r_old["total_return"]
+        marker = "+" if delta > 0.01 else ("-" if delta < -0.01 else "=")
+        if delta > 0.01:
+            improved_count += 1
+        print(f"{rank:>4} {r_old['code']:>8} {r_old['name']:<10} "
+              f"{r_old['total_return']:>+7.2f}% {r_old['win_rate']:>6.1f}% {r_old['n_trades']:>5} "
+              f"{r_new['total_return']:>+7.2f}% {r_new['win_rate']:>6.1f}% {r_new['n_trades']:>5} "
+              f"{delta:>+7.2f}% {marker}")
+    print("-" * 105)
+
+    # 全局对比
+    avg_old = np.mean([r["total_return"] for r in valid_old])
+    avg_new = np.mean([r["total_return"] for r in valid_new])
+    trades_old = sum(r["n_trades"] for r in valid_old)
+    trades_new = sum(r["n_trades"] for r in valid_new)
+    wins_old = sum(r["wins"] for r in valid_old)
+    wins_new = sum(r["wins"] for r in valid_new)
+    losses_old = sum(r["losses"] for r in valid_old)
+    losses_new = sum(r["losses"] for r in valid_new)
+    wr_old = wins_old / trades_old * 100 if trades_old else 0
+    wr_new = wins_new / trades_new * 100 if trades_new else 0
+    pos_old = sum(1 for r in valid_old if r["total_return"] > 0)
+    pos_new = sum(1 for r in valid_new if r["total_return"] > 0)
+    neg_old = sum(1 for r in valid_old if r["total_return"] < 0)
+    neg_new = sum(1 for r in valid_new if r["total_return"] < 0)
+
+    print(f"\n{'':>20} {'原版':>12} {'改进版':>12} {'变化':>10}")
+    print(f"{'平均收益':>20} {avg_old:>+11.2f}% {avg_new:>+11.2f}% {avg_new-avg_old:>+9.2f}%")
+    print(f"{'盈利标的':>20} {pos_old:>12} {pos_new:>12} {pos_new-pos_old:>+10}")
+    print(f"{'亏损标的':>20} {neg_old:>12} {neg_new:>12} {neg_new-neg_old:>+10}")
+    print(f"{'总交易笔数':>20} {trades_old:>12} {trades_new:>12} {trades_new-trades_old:>+10}")
+    print(f"{'全局胜率':>20} {wr_old:>11.1f}% {wr_new:>11.1f}% {wr_new-wr_old:>+9.1f}%")
+    print(f"{'改善标的数':>20} {improved_count}/{len(pairs)} ({improved_count/len(pairs)*100:.0f}%)")
+    print("=" * 90)
+
+
 if __name__ == "__main__":
     import sys
     if len(sys.argv) > 1 and sys.argv[1] == "--batch":
         run_batch()
+    elif len(sys.argv) > 1 and sys.argv[1] == "--compare":
+        run_compare()
     else:
         code = sys.argv[1] if len(sys.argv) > 1 else "510210"
         name = sys.argv[2] if len(sys.argv) > 2 else None
-        run_backtest(code, name)
+        improved = "--improved" in sys.argv
+        run_backtest(code, name, improved=improved)
