@@ -293,17 +293,22 @@ def daily_signal(d_all, w_all, m_all, market_state):
 
 # ============ 回测主逻辑 ============
 
-def run_backtest():
+def run_backtest(code="510210", name=None):
+    ts_code = code.zfill(6)
+    suffix = "SH" if ts_code.startswith(("5", "6")) else "SZ"
+    full_code = f"{ts_code}.{suffix}"
+    label = name or ts_code
+
     print("=" * 60)
-    print("  510210 上证综指ETF 策略回测")
+    print(f"  {ts_code} {label} 策略回测")
     print("  资金: 100万 | 回测区间: 近6个月")
     print("=" * 60)
 
     end_date = datetime.now().strftime("%Y%m%d")
     start_date = "20240101"  # 拉长数据用于 EMA 预热
 
-    print("\n拉取 510210 日线数据...")
-    etf_df = fetch_daily("510210.SH", start_date, end_date)
+    print(f"\n拉取 {ts_code} 日线数据...")
+    etf_df = fetch_daily(full_code, start_date, end_date)
     print(f"  共 {len(etf_df)} 条日线, {etf_df['date'].iloc[0].date()} ~ {etf_df['date'].iloc[-1].date()}")
 
     time.sleep(1.5)
@@ -538,4 +543,7 @@ def run_backtest():
 
 
 if __name__ == "__main__":
-    run_backtest()
+    import sys
+    code = sys.argv[1] if len(sys.argv) > 1 else "510210"
+    name = sys.argv[2] if len(sys.argv) > 2 else None
+    run_backtest(code, name)
