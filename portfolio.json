@@ -1,0 +1,11 @@
+{
+  "capital": 1000000,
+  "as_of": "2026-06-20",
+  "cash_pct": 30,
+  "positions": [
+    {"code": "510210", "name": "上证综指", "target_pct": 40, "target_amt": 400000, "first_buy": 0,     "filled": 400000, "cost": 0,    "status": "已持有·观望(变盘待定),方向未明不加仓;跌破止损优先减"},
+    {"code": "159713", "name": "稀土",     "target_pct": 12, "target_amt": 120000, "first_buy": 60000, "filled": 0,      "cost": 0,    "status": "待买·今日首笔6万,余6万回踩加仓"},
+    {"code": "563880", "name": "自由现金流", "target_pct": 10, "target_amt": 100000, "first_buy": 50000, "filled": 0,      "cost": 0,    "status": "待买·今日首笔5万,余5万回踩加仓"},
+    {"code": "512100", "name": "中证1000", "target_pct": 8,  "target_amt": 80000,  "first_buy": 40000, "filled": 0,      "cost": 0,    "status": "待买·今日首笔4万,余4万回踩加仓"}
+  ]
+}

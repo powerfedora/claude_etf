@@ -1,7 +1,11 @@
 """
 报告生成: 把所有ETF分析结果汇总成 HTML
 """
+import json
 from datetime import datetime
+from pathlib import Path
+
+PORTFOLIO_FILE = Path(__file__).resolve().parent / "portfolio.json"
 
 # 分类排序优先级 (越上越值得看)
 CAT_ORDER = {
@@ -18,6 +22,88 @@ CAT_COLOR = {
     "观望-变盘待定": "#888", "观望-待周线点头": "#888", "观望": "#888",
     "回避-向下变盘": "#bbb", "回避": "#bbb",
 }
+
+
+def _wan(x):
+    """元 -> 万 显示, 整数省略小数。"""
+    try:
+        return f"{x/10000:g}万"
+    except Exception:
+        return "—"
+
+
+def build_portfolio_panel(rows):
+    """读取 portfolio.json, 渲染"我的组合"面板; 止损位取当日 EMA34, 自动刷新并提醒破位。"""
+    if not PORTFOLIO_FILE.exists():
+        return ""
+    try:
+        pf = json.loads(PORTFOLIO_FILE.read_text(encoding="utf-8"))
+    except Exception as e:
+        return f'<div class="focusbox"><h2>💼 我的组合</h2><span style="color:#e53935">portfolio.json 解析失败: {e}</span></div>'
+
+    by_code = {r["code"]: r for r in rows}
+    cap = pf.get("capital", 0)
+    trs = ""
+    filled_sum = 0
+    for p in pf.get("positions", []):
+        r = by_code.get(p["code"], {})
+        price = r.get("price")
+        cat = r.get("category", "—")
+        pos = r.get("pos_pct")
+        ema34 = (r.get("ema_day") or {}).get("EMA34")
+        filled = p.get("filled", 0)
+        filled_sum += filled
+
+        # 止损提醒: 现价 vs 当日 EMA34
+        if price is not None and ema34:
+            stop_txt = f"{ema34}"
+            if price < ema34:
+                stop_alert = '<span style="color:#e53935;font-weight:700">⚠跌破EMA34·考虑止损</span>'
+            else:
+                d = (price - ema34) / ema34 * 100
+                stop_alert = f'<span style="color:#43a047">距止损 +{d:.1f}%</span>'
+        else:
+            stop_txt = "—"; stop_alert = "—"
+
+        # 浮盈(若已填成交均价 cost)
+        pl = ""
+        cost = p.get("cost") or 0
+        if cost and price is not None:
+            plpct = (price - cost) / cost * 100
+            color = "#43a047" if plpct >= 0 else "#e53935"
+            tag = " 🎯达止盈线" if plpct >= 12 else ""
+            pl = f'<span style="color:{color}">{plpct:+.1f}%{tag}</span>'
+
+        trs += f"""<tr>
+          <td><b>{p['name']}</b><br><span class="code">{p['code']}</span></td>
+          <td class="px">{price if price is not None else '—'}</td>
+          <td style="font-size:12px">{cat}</td>
+          <td class="pos">{pos if pos is not None else '—'}%</td>
+          <td><b>{p.get('target_pct',0)}%</b></td>
+          <td>{_wan(p.get('target_amt',0))}</td>
+          <td>{_wan(p.get('first_buy',0))}</td>
+          <td><b>{_wan(filled)}</b>{('<br>'+pl) if pl else ''}</td>
+          <td>{stop_txt}</td>
+          <td>{stop_alert}</td>
+          <td style="font-size:12px;line-height:1.5">{p.get('status','')}</td>
+        </tr>"""
+
+    cash = cap - filled_sum
+    invested_pct = filled_sum / cap * 100 if cap else 0
+    trs += f"""<tr style="background:#fafafa">
+          <td><b>现金</b></td><td>—</td><td>—</td><td>—</td>
+          <td><b>{pf.get('cash_pct','')}%</b></td><td>—</td><td>—</td>
+          <td><b>{_wan(cash)}</b></td><td>—</td><td>—</td>
+          <td style="font-size:12px">子弹: 回踩加仓/防守</td></tr>"""
+
+    return f"""<div class="focusbox">
+      <h2>💼 我的组合 &nbsp;总{_wan(cap)} ｜ 已投{_wan(filled_sum)}({invested_pct:.0f}%) ｜ 现金{_wan(cash)}</h2>
+      <table>
+       <tr><th>标的</th><th>现价</th><th>当前信号</th><th>月线位置</th><th>目标占比</th><th>目标金额</th><th>今日首笔</th><th>已建仓/浮盈</th><th>止损(EMA34)</th><th>止损提醒</th><th>状态/动作</th></tr>
+       {trs}
+      </table>
+      <div style="font-size:11px;color:#aaa;margin-top:8px">止损位取当日日线 EMA34, 每次重跑自动刷新; 跌破并转死叉再离场。"已建仓/成交均价(cost)/状态" 在 portfolio.json 中维护。</div>
+    </div>"""
 
 
 def build_reports(results, market_state, out_html):
@@ -47,6 +133,8 @@ def build_reports(results, market_state, out_html):
     focus_html = "".join(
         f'<span class="chip">{r["name"]} <b>{r["score"]}分</b></span>' for r in focus
     ) or '<span style="color:#999">本次无达标(≥4分且有信号)标的</span>'
+
+    portfolio_panel = build_portfolio_panel(rows)
 
     html = f"""<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -81,6 +169,7 @@ def build_reports(results, market_state, out_html):
   <h2>🎯 本次可关注 ({len(focus)} 只)</h2>
   {focus_html}
 </div>
+{portfolio_panel}
 <table>
   <tr><th>标的</th><th>现价</th><th>分类/打分</th><th>月/周/日</th><th>月线位置</th><th>结论 / 触发信号</th></tr>
   {cards}
