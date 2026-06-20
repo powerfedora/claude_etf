@@ -25,6 +25,7 @@ PROFIT_TRAIL = 0.12                                 # 移动止盈触发浮盈
 ANT_LOOKBACK = 8                                    # 蚂蚁上树: 价格贴均线上爬的回溯天数
 ANT_ABOVE_RATIO = 0.7                               # 蚂蚁上树: 近N日收盘站上EMA13的比例门槛
 ANT_MAX_POS = 60                                    # 蚂蚁上树: 月线位置%上限, 超过视为高位追涨, 不算蚂蚁上树
+HIGH_POS_WARN = 85                                  # 可关注类: 月线位置%达此值则加"高位追涨"警示(不改分类)
 STICK_THRESHOLD = 0.015                             # 粘合共振: 三线最大间距/价 < 此值视为粘合
 STICK_WINDOW = 10                                   # 粘合共振: 回溯N日内是否出现过粘合
 STICK_BREAK = 0.005                                 # 粘合共振: 突破粘合带的缓冲幅度
@@ -249,6 +250,10 @@ def analyze_one(code: str, name: str, df_daily: pd.DataFrame, market_state: str)
             verdict = f"多头排列但无新信号(打分{score}), 持有不追"
     else:
         category = "观望"; verdict = f"信号不足(打分{score})"
+
+    # --- 高位提示: 可关注类若已在高位, 不改分类, 仅警示追涨风险 ---
+    if category.startswith("可关注") and pos_pct >= HIGH_POS_WARN:
+        verdict += f" ⚠高位(月线{pos_pct:.0f}%≥{HIGH_POS_WARN}%), 追涨宜轻仓+严止损"
 
     return {
         "code": code, "name": name, "price": round(price, 3),
