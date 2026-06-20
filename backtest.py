@@ -63,8 +63,18 @@ def ts_api(api_name, **params):
     return pd.DataFrame(items, columns=fields)
 
 
+def _is_stock(ts_code):
+    """判断是股票还是ETF/基金。6开头沪市股票, 0/3开头深市股票; 5开头沪市基金, 1开头深市基金。"""
+    code = ts_code.split(".")[0]
+    return code.startswith(("6", "0", "3"))
+
+
 def fetch_daily(ts_code, start, end):
-    df = ts_api("fund_daily", ts_code=ts_code, start_date=start, end_date=end,
+    is_stock = _is_stock(ts_code)
+    api_name = "daily" if is_stock else "fund_daily"
+    adj_api = "adj_factor" if is_stock else "fund_adj"
+
+    df = ts_api(api_name, ts_code=ts_code, start_date=start, end_date=end,
                 fields="trade_date,open,high,low,close,vol")
     df = df.rename(columns={"trade_date": "date", "vol": "volume"})
     df["date"] = pd.to_datetime(df["date"], format="%Y%m%d")
@@ -72,8 +82,11 @@ def fetch_daily(ts_code, start, end):
         df[c] = pd.to_numeric(df[c], errors="coerce")
     df = df.sort_values("date").dropna().reset_index(drop=True)
 
-    adj = ts_api("fund_adj", ts_code=ts_code, start_date=start, end_date=end,
-                 fields="trade_date,adj_factor")
+    try:
+        adj = ts_api(adj_api, ts_code=ts_code, start_date=start, end_date=end,
+                     fields="trade_date,adj_factor")
+    except Exception:
+        adj = pd.DataFrame()
     if not adj.empty:
         adj["date"] = pd.to_datetime(adj["trade_date"], format="%Y%m%d")
         adj["adj_factor"] = pd.to_numeric(adj["adj_factor"], errors="coerce")
@@ -298,8 +311,12 @@ STICK_COOLDOWN = 10  # 改进: 粘合止损后冷却期(交易日)
 def run_backtest(code="510210", name=None, idx_df=None, quiet=False, improved=False):
     """回测单只ETF。improved=True 启用3项改进: 次日确认/放量过滤/冷却期。"""
     ts_code = code.zfill(6)
-    suffix = "SH" if ts_code.startswith(("5", "6")) else "SZ"
-    full_code = f"{ts_code}.{suffix}"
+    if "." in code:
+        full_code = code
+        ts_code = code.split(".")[0]
+    else:
+        suffix = "SH" if ts_code.startswith(("5", "6")) else "SZ"
+        full_code = f"{ts_code}.{suffix}"
     label = name or ts_code
 
     end_date = datetime.now().strftime("%Y%m%d")
