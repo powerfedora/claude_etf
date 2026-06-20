@@ -8,10 +8,32 @@
 ## 一、首次准备（只做一次）
 
 ```bash
-pip install akshare pandas numpy openpyxl
+pip install pandas numpy openpyxl requests
 ```
 
-> akshare 是免费开源的 A 股数据库（取数自东方财富等），ETF 日线数据足够用。
+### 配置数据源 Tushare token
+
+本工具的数据源是 **Tushare Pro MCP**（`fund_daily` / `index_daily`），需要你自己的 token。
+
+1. 去 [tushare.pro](https://tushare.pro) 注册并登录，在「个人主页 → 接口 TOKEN」里复制你的 token。
+2. 复制示例配置为正式配置：
+
+   ```bash
+   cp tushare_mcp.example.json tushare_mcp.json
+   ```
+
+3. 打开 `tushare_mcp.json`，把 `你的TUSHARE_TOKEN` 换成第 1 步复制的 token：
+
+   ```json
+   {
+     "mcp_url": "https://api.tushare.pro/mcp/?token=cf4790f0...你的token"
+   }
+   ```
+
+   也可以不写文件、改用环境变量：`export TUSHARE_MCP_URL="https://api.tushare.pro/mcp/?token=你的token"`
+
+> ⚠️ **安全提醒**：`tushare_mcp.json` 含你的私人 token，已被 `.gitignore` 排除，**不会**被提交到 Git。
+> 切勿把 token 贴进任何会公开的地方；换机器时按上面步骤重新配置即可。token 若泄露，去 tushare.pro 后台重置。
 
 ## 二、填入你的 ETF 代码
 
