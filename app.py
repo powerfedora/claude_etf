@@ -17,6 +17,7 @@ from flask import Flask, jsonify, request, Response
 from engine import analyze_one, add_emas, EMA_FAST, EMA_MID, EMA_SLOW
 from tushare_client import TushareMcpClient
 from history import load_snapshots, record_snapshot
+from portfolio_signal import adjust_signal_for_holding
 
 app = Flask(__name__)
 ROOT = Path(__file__).resolve().parent
@@ -388,6 +389,11 @@ def _append_realtime_bar(df, code):
 
     live = fetch_realtime([code])
     q = live.get(code)
+    live_price = q.get("price") if q else None
+    if live_price and not _is_etf_code(code.zfill(6)):
+        df = TushareMcpClient.fix_mcp_price_scale(df, live_price)
+        last_date = df["date"].iloc[-1] if not df.empty else last_date
+
     if q and q.get("price"):
         if today > last_date and today.weekday() < 5:
             new_row = pd.DataFrame([{
@@ -400,11 +406,13 @@ def _append_realtime_bar(df, code):
             }])
             df = pd.concat([df, new_row], ignore_index=True)
         elif today == last_date:
+            o = q["open"] if q.get("open") else q["price"]
+            h = q["high"] if q.get("high") else q["price"]
+            l = q["low"] if q.get("low") else q["price"]
+            df.loc[df.index[-1], "open"] = o
+            df.loc[df.index[-1], "high"] = h
+            df.loc[df.index[-1], "low"] = l
             df.loc[df.index[-1], "close"] = q["price"]
-            if q["high"] and q["high"] > df.iloc[-1]["high"]:
-                df.loc[df.index[-1], "high"] = q["high"]
-            if q["low"] and q["low"] < df.iloc[-1]["low"]:
-                df.loc[df.index[-1], "low"] = q["low"]
             if q["volume"]:
                 df.loc[df.index[-1], "volume"] = q["volume"]
 
@@ -935,12 +943,18 @@ def api_portfolio():
         if cost and price:
             pl_pct = round((price - cost) / cost * 100, 1)
 
+        scan_cat = cat
+        stop_breach = stop_alert == "warn"
+        cat, verdict, scan_cat = adjust_signal_for_holding(
+            scan_cat, verdict, filled, p.get("target_amt", 0), stop_breach=stop_breach)
+
         result_positions.append({
             "code": code,
             "name": p.get("name", ""),
             "price": price,
             "live_change": live_change,
             "category": cat,
+            "scan_category": scan_cat,
             "score": score,
             "pos_pct": pos_pct,
             "target_pct": p.get("target_pct", 0),
@@ -1112,6 +1126,15 @@ td{padding:10px;border-top:1px solid #f0f0f0;font-size:13px;vertical-align:top}
 #timeline-chart{width:100%;min-height:400px}
 .spin{display:inline-block;width:16px;height:16px;border:2px solid #ddd;border-top-color:#1890ff;border-radius:50%;animation:spin .6s linear infinite;vertical-align:middle;margin-right:6px}
 @keyframes spin{to{transform:rotate(360deg)}}
+.stock-modal{position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:9999;display:none;align-items:center;justify-content:center;padding:16px}
+.stock-modal.open{display:flex}
+.stock-modal-box{background:#fff;border-radius:12px;width:min(920px,100%);max-height:90vh;overflow:auto;box-shadow:0 8px 32px rgba(0,0,0,.2)}
+.stock-modal-head{display:flex;justify-content:space-between;align-items:center;padding:14px 18px;border-bottom:1px solid #eee;position:sticky;top:0;background:#fff;z-index:1}
+.stock-modal-head h2{font-size:17px;font-weight:600;margin:0}
+.stock-modal-close{background:none;border:none;font-size:26px;line-height:1;cursor:pointer;color:#999;padding:0 4px}
+.stock-modal-close:hover{color:#333}
+.stock-modal-body{padding:0 18px 18px}
+#stock-modal-chart{width:100%;height:460px}
 </style></head><body>
 <nav>
   <div class="brand">ETF 扫描仪</div>
@@ -1194,7 +1217,7 @@ td{padding:10px;border-top:1px solid #f0f0f0;font-size:13px;vertical-align:top}
     <div style="overflow-x:auto">
       <table>
         <thead><tr>
-          <th>标的</th><th>现价</th><th>当前信号</th><th>月线位置</th>
+          <th>标的</th><th>现价</th><th>持仓建议</th><th>月线位置</th>
           <th>目标占比</th><th>目标金额</th><th>今日首笔</th>
           <th>已建仓/浮盈</th><th>止损(EMA34)</th><th>止损提醒</th><th>状态/动作</th>
         </tr></thead>
@@ -1281,16 +1304,37 @@ td{padding:10px;border-top:1px solid #f0f0f0;font-size:13px;vertical-align:top}
   </div>
 </div>
 
+<div id="stock-modal" class="stock-modal" onclick="if(event.target===this)closeStockModal()">
+  <div class="stock-modal-box" onclick="event.stopPropagation()">
+    <div class="stock-modal-head">
+      <h2 id="stock-modal-title">加载中...</h2>
+      <button type="button" class="stock-modal-close" onclick="closeStockModal()" title="关闭">&times;</button>
+    </div>
+    <div class="stock-modal-body">
+      <div class="card" id="stock-modal-summary" style="margin-top:16px"></div>
+      <div class="card">
+        <h2 style="font-size:15px;margin-bottom:8px">K线 + EMA 13/34/55</h2>
+        <div id="stock-modal-chart"></div>
+      </div>
+      <div class="card">
+        <h2 style="font-size:15px;margin-bottom:8px">详细分析</h2>
+        <table id="stock-modal-detail"></table>
+      </div>
+    </div>
+  </div>
+</div>
+
 <script>
 const CAT_COLOR = {
   '可关注-回踩':'#e53935','可关注-金叉':'#e53935','可关注-向上变盘':'#e53935','可关注-蚂蚁上树':'#ff5722',
-  '持有/观察':'#fb8c00',
+  '持有/观察':'#fb8c00','持有/已建仓':'#fb8c00','持有/可加仓':'#e53935','持有/已满仓':'#fb8c00','持有/止损警戒':'#ff5722',
   '观望-变盘待确认':'#ff9800','观望-变盘待定':'#888','观望-待周线点头':'#888','观望':'#888',
   '回避-向下变盘':'#bbb','回避':'#bbb',
 };
 const CAT_ORDER = {
   '可关注-回踩':0,'可关注-金叉':1,'可关注-向上变盘':2,'可关注-蚂蚁上树':3,
-  '持有/观察':4,
+  '持有/可加仓':3,
+  '持有/观察':4,'持有/已建仓':4,'持有/已满仓':4,'持有/止损警戒':4,
   '观望-变盘待确认':5,'观望-变盘待定':6,'观望-待周线点头':7,'观望':8,
   '回避-向下变盘':9,'回避':10,
 };
@@ -1675,10 +1719,18 @@ function loadPortfolio() {
       if (p.stop_alert === 'warn') stopHtml = '<span style="color:#e53935;font-weight:700">'+p.stop_alert_text+'</span>';
       else if (p.stop_alert === 'ok') stopHtml = '<span style="color:#43a047">'+p.stop_alert_text+'</span>';
 
+      let sigHtml = '<span class="badge" style="background:'+cc+'">'+p.category+'</span>';
+      if (p.scan_category && p.scan_category !== p.category) {
+        sigHtml += '<br><span class="meta">扫描: '+p.scan_category+'</span>';
+      }
+      if (p.verdict) {
+        sigHtml += '<br><span class="meta" style="line-height:1.5">'+p.verdict+'</span>';
+      }
+
       tbody += '<tr>'
         +'<td><b>'+p.name+'</b><br><span class="meta">'+p.code+'</span></td>'
         +'<td style="font-weight:600;color:'+priceColor+'">'+(p.price?p.price.toFixed(3):'—')+'</td>'
-        +'<td><span class="badge" style="background:'+cc+'">'+p.category+'</span></td>'
+        +'<td style="font-size:12px;line-height:1.6">'+sigHtml+'</td>'
         +'<td>'+(p.pos_pct!==null?p.pos_pct+'%':'—')+'</td>'
         +'<td><b>'+p.target_pct+'%</b></td>'
         +'<td>'+wan(p.target_amt)+'</td>'
@@ -1706,6 +1758,7 @@ function loadPortfolio() {
 
 // ============ Lookup ============
 let lookupMainChart = null;
+let stockModalChart = null;
 let lookupHistory = JSON.parse(localStorage.getItem('lookupHistory')||'[]');
 let activeCode = '';
 
@@ -1846,9 +1899,19 @@ function doLookup() {
 
 renderHistory();
 
-function renderLookup(r, chart) {
+function getLookupChart(chartElId) {
+  const el = document.getElementById(chartElId);
+  if (chartElId === 'lookup-chart') {
+    if (!lookupMainChart) lookupMainChart = echarts.init(el);
+    return lookupMainChart;
+  }
+  if (!stockModalChart) stockModalChart = echarts.init(el);
+  return stockModalChart;
+}
+
+function renderLookupContent(r, chart, summaryId, detailId, chartElId) {
   const cc = CAT_COLOR[r.category]||'#888';
-  document.getElementById('lookup-summary').innerHTML =
+  document.getElementById(summaryId).innerHTML =
     '<div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:8px">'
     +'<div><h2 style="font-size:20px">'+(r.name||r.code)+' <span class="meta">'+r.code+' · '+(r._type||'')+'</span></h2>'
     +'<div class="meta">大盘 '+(r._market||'—')+'</div></div>'
@@ -1875,10 +1938,9 @@ function renderLookup(r, chart) {
     ['三线粘合', r.is_stick?('✅ 方向:'+r.stick_dir+' 间距:'+r.stick_spread+'%'):'—'],
     ['打分依据', '<span class="meta">'+ ((r.reasons||[]).join(' · ')||'—') +'</span>'],
   ];
-  document.getElementById('lookup-detail').innerHTML = rows.map(([k,v])=>
+  document.getElementById(detailId).innerHTML = rows.map(([k,v])=>
     '<tr><td style="color:#888;white-space:nowrap;width:130px">'+k+'</td><td>'+v+'</td></tr>').join('');
 
-  // K-line chart + volume
   const dates = chart.map(r=>r.date);
   const upC='#e53935', dnC='#2196f3';
   const ohlc = chart.map(r=>[r.open,r.close,r.low,r.high]);
@@ -1892,10 +1954,8 @@ function renderLookup(r, chart) {
     return v;
   };
 
-  const el1 = document.getElementById('lookup-chart');
-  if (!lookupMainChart) lookupMainChart = echarts.init(el1);
-
-  lookupMainChart.setOption({
+  const chartInst = getLookupChart(chartElId);
+  chartInst.setOption({
     animation:false,
     grid:[
       {left:60,right:20,top:20,height:'58%'},
@@ -1933,7 +1993,11 @@ function renderLookup(r, chart) {
       {name:'成交量',type:'bar',xAxisIndex:1,yAxisIndex:1,data:volData,barMaxWidth:12}
     ]
   }, true);
-  setTimeout(()=>{lookupMainChart.resize();},100);
+  setTimeout(()=>{ chartInst.resize(); }, 80);
+}
+
+function renderLookup(r, chart) {
+  renderLookupContent(r, chart, 'lookup-summary', 'lookup-detail', 'lookup-chart');
 
   // Load constituents for ETF
   if (r._type === 'ETF') {
@@ -1989,6 +2053,40 @@ function refreshConstituents() {
   loadConstituents(constEtfCode, true);
 }
 
+function openStockModal(code) {
+  const modal = document.getElementById('stock-modal');
+  modal.classList.add('open');
+  document.body.style.overflow = 'hidden';
+  document.getElementById('stock-modal-title').innerHTML = '<span class="spin"></span>加载 '+code+'...';
+  document.getElementById('stock-modal-summary').innerHTML = '';
+  document.getElementById('stock-modal-detail').innerHTML = '';
+  fetch('/api/lookup?code=' + encodeURIComponent(code))
+    .then(r=>r.json()).then(data => {
+      if (data.error) {
+        document.getElementById('stock-modal-title').textContent = code;
+        document.getElementById('stock-modal-summary').innerHTML =
+          '<div style="color:#cf1322;padding:20px;text-align:center">❌ '+data.error+'</div>';
+        return;
+      }
+      const r = data.result;
+      document.getElementById('stock-modal-title').textContent = (r.name||code)+' '+r.code;
+      renderLookupContent(r, data.chart, 'stock-modal-summary', 'stock-modal-detail', 'stock-modal-chart');
+    }).catch(e => {
+      document.getElementById('stock-modal-title').textContent = code;
+      document.getElementById('stock-modal-summary').innerHTML =
+        '<div style="color:#cf1322;padding:20px;text-align:center">❌ '+e+'</div>';
+    });
+}
+
+function closeStockModal() {
+  document.getElementById('stock-modal').classList.remove('open');
+  document.body.style.overflow = '';
+}
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') closeStockModal();
+});
+
 function sortConst(key) {
   if (constSortKey === key) constSortAsc = !constSortAsc;
   else { constSortKey = key; constSortAsc = key === 'name' || key === 'code'; }
@@ -2006,7 +2104,7 @@ function renderConstTable() {
     const cc = CAT_COLOR[s.category]||'#ccc';
     const chgColor = s.change > 0 ? '#e53935' : (s.change < 0 ? '#2196f3' : '#333');
     const chgSign = s.change > 0 ? '+' : '';
-    return '<tr style="cursor:pointer" onclick="document.getElementById(\\'lookup-input\\').value=\\''+s.code+'\\';document.getElementById(\\'lookup-name\\').value=\\'\\';doLookup()">'
+    return '<tr style="cursor:pointer" onclick="openStockModal(\\''+s.code+'\\')">'
       +'<td>'+s.name+'</td>'
       +'<td class="meta">'+s.code+'</td>'
       +'<td style="text-align:right;font-weight:600">'+((s.price||0).toFixed(2))+'</td>'
@@ -2022,8 +2120,18 @@ function renderConstTable() {
 window.addEventListener('resize', () => {
   if (tlChart) tlChart.resize();
   if (lookupMainChart) lookupMainChart.resize();
+  if (stockModalChart) stockModalChart.resize();
 });
 loadReport();
+(function initLookupFromUrl() {
+  const params = new URLSearchParams(window.location.search);
+  const code = params.get('code');
+  if (code && window.location.hash === '#lookup') {
+    document.querySelector('.tab[data-page="lookup"]').click();
+    document.getElementById('lookup-input').value = code;
+    doLookup();
+  }
+})();
 let scan_state_running = false;
 let refreshCountdown = 60;
 setInterval(() => {

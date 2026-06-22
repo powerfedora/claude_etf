@@ -149,6 +149,23 @@ class TushareMcpClient:
             out[col] = merged[col] * factor
         return out
 
+    @staticmethod
+    def fix_mcp_price_scale(df: pd.DataFrame, live_price) -> pd.DataFrame:
+        """Tushare MCP 部分标的日线 OHLC 为实际价格的 10 倍, 按实时价校正。"""
+        if df is None or df.empty or not live_price or live_price <= 0:
+            return df
+        last_close = float(df.iloc[-1]["close"])
+        if last_close <= 0:
+            return df
+        ratio = last_close / float(live_price)
+        if 8 <= ratio <= 12:
+            out = df.copy()
+            for col in ("open", "high", "low", "close"):
+                if col in out.columns:
+                    out[col] = out[col] / 10
+            return out
+        return df
+
     def fetch_fund_daily(
         self,
         code: str,
