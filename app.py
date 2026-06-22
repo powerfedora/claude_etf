@@ -239,9 +239,21 @@ def _em_secid(code):
     return "0." + code
 
 
+_em_http_session = None
+
+
+def _em_http():
+    """东方财富 HTTP 会话, 直连不走系统代理。"""
+    global _em_http_session
+    if _em_http_session is None:
+        import requests
+        _em_http_session = requests.Session()
+        _em_http_session.trust_env = False
+    return _em_http_session
+
+
 def _fetch_realtime_eastmoney(codes):
     """东方财富 HTTPS 行情 (备用通道, 无需认证)"""
-    import requests as _req
     if not codes:
         return {}
     secids = ",".join(_em_secid(c) for c in codes)
@@ -251,7 +263,7 @@ def _fetch_realtime_eastmoney(codes):
             "?fields=f12,f14,f2,f3,f15,f16,f17,f6,f5,f18"
             "&secids=" + secids
         )
-        r = _req.get(url, timeout=8, headers={"Referer": "https://quote.eastmoney.com"})
+        r = _em_http().get(url, timeout=8, headers={"Referer": "https://quote.eastmoney.com"})
         data = r.json().get("data", {})
         rows = data.get("diff") if data else None
         if not rows:
@@ -303,7 +315,6 @@ def fetch_realtime(codes):
 def _fetch_kline_eastmoney(code, limit=5):
     """从东方财富获取最近几根日K线 (HTTPS), 用于补齐 Tushare 延迟"""
     import pandas as pd
-    import requests as _req
     secid = _em_secid(code)
     try:
         url = (
@@ -311,7 +322,7 @@ def _fetch_kline_eastmoney(code, limit=5):
             f"?secid={secid}&fields1=f1,f2,f3&fields2=f51,f52,f53,f54,f55,f56"
             f"&klt=101&fqt=1&end=20500101&lmt={limit}"
         )
-        r = _req.get(url, timeout=8, headers={"Referer": "https://quote.eastmoney.com"})
+        r = _em_http().get(url, timeout=8, headers={"Referer": "https://quote.eastmoney.com"})
         data = r.json().get("data", {})
         klines = data.get("klines") if data else None
         if not klines:
@@ -375,6 +386,33 @@ def _append_realtime_bar(df, code):
                 df.loc[df.index[-1], "volume"] = q["volume"]
 
     return df, q
+
+
+def _load_scan_index():
+    """读取最近一次全量扫描结果, 供组合表与扫描报告保持一致。"""
+    if not SCAN_FILE.exists():
+        return {}, None, None
+    try:
+        data = json.loads(SCAN_FILE.read_text(encoding="utf-8"))
+        index = {
+            r["code"]: r for r in data.get("results", [])
+            if r.get("code") and not r.get("error")
+        }
+        return index, data.get("ts"), data.get("market")
+    except Exception:
+        return {}, None, None
+
+
+def _analyze_etf(code, name, client=None, market=None):
+    """与全量扫描相同: Tushare 前复权日线 + 实时补 bar + analyze_one。"""
+    if client is None:
+        client = TushareMcpClient()
+    if market is None:
+        market = _get_market(client)
+    end = datetime.now().strftime("%Y%m%d")
+    df = client.fetch_fund_daily(code, START_DATE, end)
+    df, _ = _append_realtime_bar(df, code)
+    return analyze_one(code, name, df, market), market
 
 
 # ---------- API routes ----------
@@ -623,9 +661,9 @@ def api_constituents():
     if not code or len(code) != 6:
         return jsonify({"error": "无效代码"}), 400
 
-    stocks = _fetch_etf_constituents(code)
+    stocks, period = _fetch_etf_constituents(code)
     if not stocks:
-        return jsonify({"stocks": [], "msg": "未找到成份股数据"})
+        return jsonify({"stocks": [], "msg": "未找到成份股数据(基金季报持仓可能尚未披露)"})
 
     stock_codes = [s["code"] for s in stocks]
     quotes = _fetch_realtime_eastmoney(stock_codes)
@@ -665,34 +703,39 @@ def api_constituents():
             s["verdict"] = ""
 
     return Response(
-        json.dumps({"stocks": stocks}, ensure_ascii=False, default=_json_default),
+        json.dumps({"stocks": stocks, "period": period}, ensure_ascii=False, default=_json_default),
         mimetype="application/json")
 
 
 def _fetch_etf_constituents(code):
-    import requests as _req
-    secid = _em_secid(code)
+    """从天天基金抓取 ETF 最新季报股票持仓 (非实时申赎清单)。"""
+    import re
     try:
-        url = (
-            "https://push2.eastmoney.com/api/qt/clist/get"
-            f"?np=1&fltt=2&invt=2&fid=f3&fs=b:{secid}&pn=1&pz=200"
-            "&fields=f12,f14"
+        r = _em_http().get(
+            "https://fundf10.eastmoney.com/FundArchivesDatas.aspx",
+            params={"type": "jjcc", "code": code, "topline": "200", "year": "", "month": "", "page": 1},
+            timeout=12,
+            headers={"Referer": "https://fundf10.eastmoney.com", "User-Agent": "Mozilla/5.0"},
         )
-        r = _req.get(url, timeout=10, headers={
-            "Referer": "https://quote.eastmoney.com",
-            "User-Agent": "Mozilla/5.0",
-        })
-        data = r.json().get("data", {})
-        rows = data.get("diff") if data else None
-        if not rows:
-            return []
-        return [{"code": str(item.get("f12", "")), "name": item.get("f14", "")} for item in rows if item.get("f12")]
+        r.raise_for_status()
+        period_m = re.search(r"(\d{4}年\d季度)", r.text)
+        period = period_m.group(1) if period_m else ""
+        seen = set()
+        stocks = []
+        for c, name in re.findall(
+            r"class='tol'><a href='//quote.eastmoney.com/unify/r/[01]\.(\d{6})'>([^<]+)</a>",
+            r.text,
+        ):
+            if c in seen:
+                continue
+            seen.add(c)
+            stocks.append({"code": c, "name": name})
+        return stocks, period
     except Exception:
-        return []
+        return [], ""
 
 
 def _fetch_volume_ratio_eastmoney(codes):
-    import requests as _req
     if not codes:
         return {}
     secids = ",".join(_em_secid(c) for c in codes)
@@ -701,7 +744,7 @@ def _fetch_volume_ratio_eastmoney(codes):
             "https://push2.eastmoney.com/api/qt/ulist.np/get"
             "?fields=f12,f10&secids=" + secids
         )
-        r = _req.get(url, timeout=8, headers={"Referer": "https://quote.eastmoney.com"})
+        r = _em_http().get(url, timeout=8, headers={"Referer": "https://quote.eastmoney.com"})
         data = r.json().get("data", {})
         rows = data.get("diff") if data else None
         if not rows:
@@ -734,13 +777,15 @@ def api_portfolio():
     cap = pf.get("capital", 0)
 
     codes = [p["code"] for p in positions]
-    quotes = _fetch_realtime_eastmoney(codes)
+    quotes = fetch_realtime(codes)
 
+    scan_index, scan_ts, scan_market = _load_scan_index()
     try:
         client = TushareMcpClient()
-        market = _get_market(client)
+        market = scan_market or _get_market(client)
     except Exception:
-        market = "未知"
+        client = None
+        market = scan_market or "未知"
 
     result_positions = []
     filled_sum = 0
@@ -758,17 +803,29 @@ def api_portfolio():
         pos_pct = None
         verdict = ""
         score = 0
-        try:
-            kdf = _fetch_kline_eastmoney(code, limit=200)
-            if kdf is not None and len(kdf) >= 55:
-                analysis = analyze_one(code, p.get("name", code), kdf, market)
+        signal_src = ""
+
+        scanned = scan_index.get(code)
+        if scanned:
+            cat = scanned.get("category", "—")
+            score = scanned.get("score", 0)
+            pos_pct = scanned.get("pos_pct")
+            verdict = scanned.get("verdict", "")
+            ema34 = (scanned.get("ema_day") or {}).get("EMA34")
+            signal_src = "scan"
+            if not price and scanned.get("price"):
+                price = scanned.get("price")
+        elif client is not None:
+            try:
+                analysis, market = _analyze_etf(code, p.get("name", code), client, market)
                 cat = analysis.get("category", "—")
                 ema34 = (analysis.get("ema_day") or {}).get("EMA34")
                 pos_pct = analysis.get("pos_pct")
                 verdict = analysis.get("verdict", "")
                 score = analysis.get("score", 0)
-        except Exception:
-            pass
+                signal_src = "live"
+            except Exception:
+                pass
 
         stop_txt = ""
         stop_alert = ""
@@ -808,6 +865,7 @@ def api_portfolio():
             "stop_alert_text": stop_alert_text,
             "status": p.get("status", ""),
             "verdict": verdict,
+            "signal_src": signal_src,
         })
 
     cash = cap - filled_sum
@@ -839,6 +897,7 @@ def api_portfolio():
             "cash": cash,
             "cash_pct": pf.get("cash_pct", 0),
             "market": market,
+            "scan_ts": scan_ts,
             "positions": result_positions,
             "trades": trades,
         }, ensure_ascii=False, default=_json_default),
@@ -1079,6 +1138,9 @@ const CAT_LEVEL = {
   '可关注-蚂蚁上树':4,'可关注-向上变盘':5,'可关注-金叉':5,'可关注-回踩':6,
 };
 const LEVEL_LABEL = {0:'回避',1:'观望',2:'待确认',3:'持有/观察',4:'蚂蚁上树',5:'可关注',6:'回踩买'};
+const LEVEL_SHORT = {0:'回避',1:'观望',2:'待确认',3:'持有',4:'蚂蚁',5:'关注',6:'回踩'};
+const TL_LEVEL_BG = ['#eceff1','#e8edf2','#fff3e0','#ffe8cc','#ffd6c2','#ffd0d0','#ffb4b4'];
+const TL_LEVEL_FG = ['#546e7a','#546e7a','#e65100','#ef6c00','#d84315','#c62828','#b71c1c'];
 const LINE_COLORS = [
   '#e53935','#1e88e5','#43a047','#fb8c00','#8e24aa','#00acc1','#d81b60',
   '#3949ab','#7cb342','#f4511e','#6d4c41','#546e7a','#c0ca33','#00897b',
@@ -1180,7 +1242,7 @@ function loadTimeline() {
         + '暂无时间线数据<br><span style="font-size:13px;color:#aaa">请先在「扫描报告」页点击「刷新全量扫描」生成数据</span></div>';
       return;
     }
-    document.getElementById('tl-meta').textContent = data.etfs.length + ' 只ETF · ' + data.days.length + ' 个时间点';
+    document.getElementById('tl-meta').textContent = data.etfs.length + ' 只ETF · ' + data.days.length + ' 个时间点 · 底色=状态 · 白底数字=打分';
     initTlFilters();
     renderTimeline();
   });
@@ -1224,14 +1286,13 @@ function renderTimeline() {
 
   const allDates = tlData.days;
   const etfNames = etfs.map(e => e.name);
-  const chartHeight = Math.max(400, etfs.length * 28 + 160);
+  const chartHeight = Math.max(400, etfs.length * 46 + 160);
   el.style.height = chartHeight + 'px';
   el.innerHTML = '';
 
   if (tlChart) { tlChart.dispose(); tlChart = null; }
   tlChart = echarts.init(el);
 
-  const LEVEL_COLORS = ['#bdbdbd','#9e9e9e','#ffa726','#fb8c00','#ff5722','#e53935','#b71c1c'];
   const heatData = [];
   etfs.forEach((etf, yIdx) => {
     const map = {}; etf.points.forEach(p => { map[p.date] = p; });
@@ -1239,6 +1300,15 @@ function renderTimeline() {
       const p = map[d];
       if (p) heatData.push({ value:[xIdx, yIdx, CAT_LEVEL[p.cat]??1], _detail:p, _name:etf.name+' '+etf.code });
     });
+  });
+
+  const tlRich = {
+    score:{ fontSize:15, fontWeight:700, lineHeight:22, align:'center',
+      color:'#1565c0', backgroundColor:'#fff', borderColor:'#cfd8dc', borderWidth:1,
+      borderRadius:6, padding:[2,8,2,8], shadowColor:'rgba(0,0,0,.12)', shadowBlur:4 }
+  };
+  TL_LEVEL_FG.forEach((c,i) => {
+    tlRich['t'+i] = { fontSize:11, fontWeight:600, lineHeight:18, align:'center', color:c };
   });
 
   tlChart.setOption({
@@ -1282,21 +1352,30 @@ function renderTimeline() {
       type:'piecewise', orient:'horizontal', left:'center', bottom:4,
       itemWidth:18, itemHeight:12, textStyle:{fontSize:11},
       pieces:[
-        {value:0,label:'回避',color:LEVEL_COLORS[0]},
-        {value:1,label:'观望',color:LEVEL_COLORS[1]},
-        {value:2,label:'待确认',color:LEVEL_COLORS[2]},
-        {value:3,label:'持有/观察',color:LEVEL_COLORS[3]},
-        {value:4,label:'蚂蚁上树',color:LEVEL_COLORS[4]},
-        {value:5,label:'可关注',color:LEVEL_COLORS[5]},
-        {value:6,label:'回踩买',color:LEVEL_COLORS[6]}
+        {value:0,label:'回避',color:TL_LEVEL_BG[0]},
+        {value:1,label:'观望',color:TL_LEVEL_BG[1]},
+        {value:2,label:'待确认',color:TL_LEVEL_BG[2]},
+        {value:3,label:'持有/观察',color:TL_LEVEL_BG[3]},
+        {value:4,label:'蚂蚁上树',color:TL_LEVEL_BG[4]},
+        {value:5,label:'可关注',color:TL_LEVEL_BG[5]},
+        {value:6,label:'回踩买',color:TL_LEVEL_BG[6]}
       ]
     },
     series: [{
       type:'heatmap', data:heatData,
-      label:{ show: allDates.length<=7, fontSize:10, color:'#fff',
-        formatter:function(p){ return LEVEL_LABEL[p.value[2]]||''; } },
-      itemStyle:{ borderColor:'#fff', borderWidth:2, borderRadius:3 },
-      emphasis:{ itemStyle:{ shadowBlur:6, shadowColor:'rgba(0,0,0,.3)' } }
+      label:{
+        show:true,
+        formatter:function(p){
+          if (!p.data || !p.data._detail) return '';
+          const lv = p.data.value[2];
+          const tag = LEVEL_SHORT[lv] || LEVEL_LABEL[lv] || '';
+          const score = p.data._detail.score;
+          return '{t'+lv+'|'+tag+'}\\n{score|'+score+'}';
+        },
+        rich: tlRich
+      },
+      itemStyle:{ borderColor:'#fff', borderWidth:3, borderRadius:6 },
+      emphasis:{ itemStyle:{ shadowBlur:8, shadowColor:'rgba(0,0,0,.18)', borderColor:'#1890ff', borderWidth:2 } }
     }]
   }, true);
   new ResizeObserver(()=>{ if(tlChart) tlChart.resize(); }).observe(el);
@@ -1321,7 +1400,8 @@ function loadPortfolio() {
     const wan = v => (v/10000).toFixed(v%10000===0?0:1)+'万';
     document.getElementById('pf-title').textContent = '💼 我的组合';
     document.getElementById('pf-summary').innerHTML =
-      '总 <b>'+wan(d.capital)+'</b> ｜ 已投 <b>'+wan(d.filled)+'</b>('+d.invested_pct+'%) ｜ 现金 <b>'+wan(d.cash)+'</b> ｜ 大盘 <b>'+d.market+'</b>';
+      '总 <b>'+wan(d.capital)+'</b> ｜ 已投 <b>'+wan(d.filled)+'</b>('+d.invested_pct+'%) ｜ 现金 <b>'+wan(d.cash)+'</b> ｜ 大盘 <b>'+d.market+'</b>'
+      + (d.scan_ts ? ' ｜ 信号同步自扫描 <span class="meta">'+d.scan_ts+'</span>' : ' ｜ <span class="meta">无扫描缓存, 信号为实时重算</span>');
 
     // Positions table
     let tbody = '';
@@ -1430,7 +1510,7 @@ function pickSuggestion(code, name) {
 inputEl.addEventListener('input', () => {
   const q = inputEl.value.trim();
   if (q.length < 1) { suggestEl.classList.remove('show'); return; }
-  if (/^\d{6}$/.test(q)) { suggestEl.classList.remove('show'); return; }
+  if (/^\\d{6}$/.test(q)) { suggestEl.classList.remove('show'); return; }
   clearTimeout(suggestTimer);
   suggestTimer = setTimeout(() => {
     fetch('/api/suggest?q='+encodeURIComponent(q))
@@ -1599,7 +1679,7 @@ function renderLookup(r, chart) {
           constData = d.stocks;
           constSortKey = 'change'; constSortAsc = false;
           constData.sort((a,b) => (b.change||0) - (a.change||0));
-          document.getElementById('const-meta').textContent = d.stocks.length + ' 只成份股';
+          document.getElementById('const-meta').textContent = (d.period ? d.period + ' · ' : '') + d.stocks.length + ' 只成份股';
           renderConstTable();
         } else {
           document.getElementById('const-meta').textContent = d.msg || '未找到成份股';
@@ -1629,7 +1709,7 @@ function renderConstTable() {
     const cc = CAT_COLOR[s.category]||'#ccc';
     const chgColor = s.change > 0 ? '#e53935' : (s.change < 0 ? '#2196f3' : '#333');
     const chgSign = s.change > 0 ? '+' : '';
-    return '<tr style="cursor:pointer" onclick="document.getElementById(\'lookup-input\').value=\''+s.code+'\';doLookup()">'
+    return '<tr style="cursor:pointer" onclick="document.getElementById(\\'lookup-input\\').value=\\''+s.code+'\\';doLookup()">'
       +'<td>'+s.name+'</td>'
       +'<td class="meta">'+s.code+'</td>'
       +'<td style="text-align:right;font-weight:600">'+((s.price||0).toFixed(2))+'</td>'
