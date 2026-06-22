@@ -10,6 +10,7 @@ ETF 多周期均线扫描 - 主程序
 
 数据源: Tushare Pro MCP (fund_daily / index_daily)
 """
+import json
 import sys
 import time
 from datetime import datetime
@@ -127,6 +128,17 @@ def main():
             except Exception as e:
                 results.append({"code": code, "name": name, "error": str(e)})
                 print(f"  [{i}/{len(codes)}] {code} {name}  -> 补抓仍失败: {e}")
+
+    # 保存完整结果供 Web 应用使用
+    def _default(o):
+        if hasattr(o, 'item'):
+            return o.item()
+        if hasattr(o, 'isoformat'):
+            return o.isoformat()
+        return str(o)
+    scan_data = {"ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "market": market, "results": results}
+    (ROOT / "last_scan.json").write_text(
+        json.dumps(scan_data, ensure_ascii=False, indent=2, default=_default), encoding="utf-8")
 
     stamp = datetime.now().strftime("%Y%m%d")
     out_html = ROOT / f"report_{stamp}.html"
