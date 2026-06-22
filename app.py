@@ -6,6 +6,7 @@ ETF 扫描仪 Web 应用 - 三合一 (扫描报告 / 信号时间线 / 个股查
 功能: 每次打开页面实时加载最新数据, 支持在线刷新扫描和个股实时查询
 """
 import json
+import os
 import threading
 import time
 from datetime import datetime
@@ -761,7 +762,8 @@ loadReport();
 
 
 if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8088))
     print("ETF 扫描仪 Web 应用")
-    print("访问: http://localhost:8088")
+    print(f"访问: http://localhost:{port}")
     print("按 Ctrl+C 停止\n")
-    app.run(host="0.0.0.0", port=8088, debug=False)
+    app.run(host="0.0.0.0", port=port, debug=False)
