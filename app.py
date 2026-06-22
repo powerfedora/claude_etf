@@ -1629,7 +1629,7 @@ function renderConstTable() {
     const cc = CAT_COLOR[s.category]||'#ccc';
     const chgColor = s.change > 0 ? '#e53935' : (s.change < 0 ? '#2196f3' : '#333');
     const chgSign = s.change > 0 ? '+' : '';
-    return '<tr style="cursor:pointer" onclick="document.getElementById(\'lookup-input\').value=\''+s.code+'\';doLookup()">'
+    return '<tr style="cursor:pointer" onclick="document.getElementById(\\'lookup-input\\').value=\\''+s.code+'\\';doLookup()">'
       +'<td>'+s.name+'</td>'
       +'<td class="meta">'+s.code+'</td>'
       +'<td style="text-align:right;font-weight:600">'+((s.price||0).toFixed(2))+'</td>'
