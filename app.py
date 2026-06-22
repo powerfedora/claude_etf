@@ -487,9 +487,23 @@ td{padding:10px;border-top:1px solid #f0f0f0;font-size:13px;vertical-align:top}
 .fbtn{padding:4px 12px;border-radius:16px;font-size:12px;border:1px solid #ddd;background:#fff;cursor:pointer}
 .fbtn:hover{border-color:#1890ff;color:#1890ff}
 .fbtn.active{background:#1890ff;color:#fff;border-color:#1890ff}
-#lookup-input{width:280px}
+#lookup-input{width:220px}
 #lookup-chart{width:100%;height:480px}
 #lookup-vol{width:100%;height:120px}
+#lookup-wrap{display:flex;gap:16px;align-items:flex-start}
+#lookup-sidebar{width:200px;flex-shrink:0;position:sticky;top:70px}
+#lookup-main{flex:1;min-width:0}
+#lookup-history{list-style:none;max-height:calc(100vh - 200px);overflow-y:auto}
+#lookup-history li{padding:10px 14px;cursor:pointer;border-bottom:1px solid #f0f0f0;font-size:13px;transition:background .12s;display:flex;justify-content:space-between;align-items:center}
+#lookup-history li:hover{background:#f5f7fa}
+#lookup-history li.active{background:#e6f7ff;border-left:3px solid #1890ff}
+#lookup-history .h-code{font-weight:600}
+#lookup-history .h-name{color:#888;font-size:11px}
+#lookup-history .h-cat{font-size:10px;white-space:nowrap}
+#lookup-history .h-remove{color:#ccc;font-size:14px;padding:0 4px;cursor:pointer;visibility:hidden}
+#lookup-history li:hover .h-remove{visibility:visible}
+#lookup-history .h-remove:hover{color:#e53935}
+@media(max-width:768px){#lookup-wrap{flex-direction:column}#lookup-sidebar{width:100%;position:static}#lookup-history{max-height:160px}}
 #timeline-chart{width:100%;height:calc(100vh - 180px);min-height:500px}
 .spin{display:inline-block;width:16px;height:16px;border:2px solid #ddd;border-top-color:#1890ff;border-radius:50%;animation:spin .6s linear infinite;vertical-align:middle;margin-right:6px}
 @keyframes spin{to{transform:rotate(360deg)}}
@@ -549,24 +563,38 @@ td{padding:10px;border-top:1px solid #f0f0f0;font-size:13px;vertical-align:top}
 <!-- ==================== 个股查询 ==================== -->
 <div class="page" id="page-lookup">
   <div class="card">
-    <h2 style="margin-bottom:12px">个股 / ETF 查询</h2>
     <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <h2 style="margin:0;white-space:nowrap">个股 / ETF 查询</h2>
       <input type="text" id="lookup-input" placeholder="输入6位代码, 如 601919 或 510210">
       <input type="text" id="lookup-name" placeholder="名称(可选)" style="width:140px">
       <button class="btn-primary" id="btn-lookup" onclick="doLookup()">查询</button>
       <span class="meta" id="lookup-status"></span>
     </div>
   </div>
-  <div id="lookup-result" style="display:none">
-    <div class="card" id="lookup-summary"></div>
-    <div class="card">
-      <h2>K线 + EMA 13/34/55 (近120日)</h2>
-      <div id="lookup-chart"></div>
-      <div id="lookup-vol"></div>
+  <div id="lookup-wrap">
+    <div id="lookup-sidebar">
+      <div class="card" style="padding:8px 0">
+        <div style="display:flex;justify-content:space-between;align-items:center;padding:4px 14px 8px">
+          <span style="font-size:13px;font-weight:600">查询历史</span>
+          <span id="history-clear" style="font-size:11px;color:#1890ff;cursor:pointer">清空</span>
+        </div>
+        <ul id="lookup-history"></ul>
+        <div id="history-empty" class="meta" style="padding:16px;text-align:center">暂无记录</div>
+      </div>
     </div>
-    <div class="card">
-      <h2>详细分析</h2>
-      <table id="lookup-detail"></table>
+    <div id="lookup-main">
+      <div id="lookup-result" style="display:none">
+        <div class="card" id="lookup-summary"></div>
+        <div class="card">
+          <h2>K线 + EMA 13/34/55 (近120日)</h2>
+          <div id="lookup-chart"></div>
+          <div id="lookup-vol"></div>
+        </div>
+        <div class="card">
+          <h2>详细分析</h2>
+          <table id="lookup-detail"></table>
+        </div>
+      </div>
     </div>
   </div>
 </div>
@@ -789,6 +817,50 @@ document.getElementById('tl-search').addEventListener('input', applyTlFilter);
 
 // ============ Lookup ============
 let lookupMainChart = null, lookupVolChart = null;
+let lookupHistory = JSON.parse(localStorage.getItem('lookupHistory')||'[]');
+let activeCode = '';
+
+function saveHistory() { localStorage.setItem('lookupHistory', JSON.stringify(lookupHistory)); }
+
+function renderHistory() {
+  const ul = document.getElementById('lookup-history');
+  const empty = document.getElementById('history-empty');
+  if (!lookupHistory.length) { ul.innerHTML=''; empty.style.display=''; return; }
+  empty.style.display='none';
+  ul.innerHTML = lookupHistory.map((h,i) => {
+    const cc = CAT_COLOR[h.cat]||'#ccc';
+    const isActive = h.code === activeCode;
+    return '<li class="'+(isActive?'active':'')+'" onclick="lookupFromHistory('+i+')">'
+      +'<div><span class="h-code">'+h.name+'</span><br><span class="h-name">'+h.code+'</span></div>'
+      +'<div style="text-align:right"><span class="h-cat badge" style="background:'+cc+'">'+h.cat+'</span>'
+      +'<span class="h-remove" onclick="event.stopPropagation();removeHistory('+i+')">&times;</span></div></li>';
+  }).join('');
+}
+
+function addHistory(code, name, cat) {
+  lookupHistory = lookupHistory.filter(h => h.code !== code);
+  lookupHistory.unshift({code, name, cat});
+  if (lookupHistory.length > 30) lookupHistory = lookupHistory.slice(0, 30);
+  saveHistory();
+  renderHistory();
+}
+
+function removeHistory(idx) {
+  lookupHistory.splice(idx, 1);
+  saveHistory();
+  renderHistory();
+}
+
+function lookupFromHistory(idx) {
+  const h = lookupHistory[idx];
+  document.getElementById('lookup-input').value = h.code;
+  document.getElementById('lookup-name').value = h.name !== h.code ? h.name : '';
+  doLookup();
+}
+
+document.getElementById('history-clear').onclick = () => {
+  lookupHistory = []; saveHistory(); renderHistory();
+};
 
 document.getElementById('lookup-input').addEventListener('keydown', e => { if(e.key==='Enter') doLookup(); });
 
@@ -796,6 +868,7 @@ function doLookup() {
   const code = document.getElementById('lookup-input').value.trim();
   const name = document.getElementById('lookup-name').value.trim() || code;
   if (!code) return;
+  activeCode = code;
   document.getElementById('btn-lookup').disabled = true;
   document.getElementById('lookup-status').innerHTML = '<span class="spin"></span>查询中...';
   document.getElementById('lookup-result').style.display = 'none';
@@ -806,12 +879,16 @@ function doLookup() {
       if (data.error) { document.getElementById('lookup-status').textContent = '❌ '+data.error; return; }
       document.getElementById('lookup-status').textContent = '';
       document.getElementById('lookup-result').style.display = '';
-      renderLookup(data.result, data.chart);
+      const r = data.result;
+      addHistory(r.code, r.name||name, r.category||'');
+      renderLookup(r, data.chart);
     }).catch(e => {
       document.getElementById('btn-lookup').disabled = false;
       document.getElementById('lookup-status').textContent = '❌ '+e;
     });
 }
+
+renderHistory();
 
 function renderLookup(r, chart) {
   const cc = CAT_COLOR[r.category]||'#888';
