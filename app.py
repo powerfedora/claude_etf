@@ -680,7 +680,7 @@ td{padding:10px;border-top:1px solid #f0f0f0;font-size:13px;vertical-align:top}
 .suggest-item .s-code{color:#888;font-size:12px;margin-left:6px}
 .suggest-item .s-type{color:#bbb;font-size:11px}
 .suggest-item em{font-style:normal;color:#1890ff;font-weight:600}
-#timeline-chart{width:100%;height:calc(100vh - 180px);min-height:500px}
+#timeline-chart{width:100%;min-height:400px}
 .spin{display:inline-block;width:16px;height:16px;border:2px solid #ddd;border-top-color:#1890ff;border-radius:50%;animation:spin .6s linear infinite;vertical-align:middle;margin-right:6px}
 @keyframes spin{to{transform:rotate(360deg)}}
 </style></head><body>
@@ -925,84 +925,53 @@ function initTlFilters() {
 function renderTimeline() {
   if (!tlData) return;
   const el = document.getElementById('timeline-chart');
-  if (!tlChart) tlChart = echarts.init(el);
+
+  const q = (document.getElementById('tl-search').value||'').trim().toLowerCase();
+  const etfs = tlData.etfs.filter(etf => {
+    const latest = etf.points[etf.points.length-1];
+    const matchQ = !q || etf.name.toLowerCase().includes(q) || etf.code.includes(q);
+    const matchF = tlFilter==='all' || latest.cat.startsWith(tlFilter);
+    return matchQ && matchF;
+  });
+
+  if (etfs.length === 0) {
+    if (tlChart) { tlChart.dispose(); tlChart = null; }
+    el.innerHTML = '<div style="text-align:center;padding:60px;color:#aaa">无匹配的ETF</div>';
+    return;
+  }
 
   const allDates = tlData.days;
+  const etfNames = etfs.map(e => e.name);
+  const chartHeight = Math.max(400, etfs.length * 28 + 160);
+  el.style.height = chartHeight + 'px';
+  el.innerHTML = '';
 
-  // Build jitter offsets: group ETFs by their latest cat level, spread within ±0.35
-  const levelGroups = {};
-  tlData.etfs.forEach((etf, i) => {
-    const latest = etf.points[etf.points.length - 1];
-    const lv = CAT_LEVEL[latest.cat] ?? 1;
-    if (!levelGroups[lv]) levelGroups[lv] = [];
-    levelGroups[lv].push(i);
-  });
-  const jitterMap = {};
-  Object.keys(levelGroups).forEach(lv => {
-    const indices = levelGroups[lv];
-    const n = indices.length;
-    indices.forEach((idx, rank) => {
-      jitterMap[idx] = n <= 1 ? 0 : (rank / (n - 1) - 0.5) * 0.7;
+  if (tlChart) { tlChart.dispose(); tlChart = null; }
+  tlChart = echarts.init(el);
+
+  const LEVEL_COLORS = ['#bdbdbd','#9e9e9e','#ffa726','#fb8c00','#ff5722','#e53935','#b71c1c'];
+  const heatData = [];
+  etfs.forEach((etf, yIdx) => {
+    const map = {}; etf.points.forEach(p => { map[p.date] = p; });
+    allDates.forEach((d, xIdx) => {
+      const p = map[d];
+      if (p) heatData.push({ value:[xIdx, yIdx, CAT_LEVEL[p.cat]??1], _detail:p, _name:etf.name+' '+etf.code });
     });
   });
 
-  const BAND_COLORS = ['rgba(187,187,187,.08)','rgba(136,136,136,.08)','rgba(255,152,0,.06)',
-    'rgba(251,140,0,.06)','rgba(255,87,34,.06)','rgba(229,57,53,.06)','rgba(229,57,53,.10)'];
-
-  const series = tlData.etfs.map((etf,i) => {
-    const map = {}; etf.points.forEach(p => { map[p.date] = p; });
-    const offset = jitterMap[i] || 0;
-    return {
-      name: etf.name+' '+etf.code,
-      type: 'line', symbol: 'circle', symbolSize: 8,
-      connectNulls: true,
-      lineStyle: { width: 2 },
-      itemStyle: { color: LINE_COLORS[i % LINE_COLORS.length] },
-      emphasis: { focus:'series', lineStyle:{width:4} },
-      blur: { lineStyle:{opacity:.1}, itemStyle:{opacity:.1} },
-      data: allDates.map(d => {
-        const p = map[d];
-        if (!p) return null;
-        return { value: (CAT_LEVEL[p.cat]??1) + offset, _detail: p, _baseLevel: CAT_LEVEL[p.cat]??1 };
-      })
-    };
-  });
-
-  // Add invisible markArea series for band backgrounds
-  const bandSeries = {
-    name: '_bands', type: 'line', data: [],
-    markArea: {
-      silent: true,
-      data: [0,1,2,3,4,5,6].map(lv => [{
-        yAxis: lv - 0.45,
-        itemStyle: { color: BAND_COLORS[lv] || 'rgba(0,0,0,.03)' }
-      }, {
-        yAxis: lv + 0.45
-      }])
-    }
-  };
-  series.unshift(bandSeries);
-
   tlChart.setOption({
-    grid: { top:80, right:30, bottom:50, left:70 },
-    legend: {
-      type:'scroll', top:5, left:10, right:10,
-      textStyle:{fontSize:11}, pageIconSize:12,
-      selector:[{type:'all',title:'全选'},{type:'inverse',title:'反选'}],
-      data: tlData.etfs.map((etf,i) => etf.name+' '+etf.code)
-    },
+    grid: { top:20, right:20, bottom:90, left:130 },
     tooltip: {
-      trigger:'item', confine:true,
+      confine:true,
       backgroundColor:'rgba(255,255,255,.98)', borderColor:'#eee', borderWidth:1,
       textStyle:{color:'#333',fontSize:12},
       extraCssText:'max-width:380px;white-space:normal;line-height:1.7;box-shadow:0 4px 16px rgba(0,0,0,.15);border-radius:8px;padding:12px',
       formatter: function(params) {
-        const p = params.data && params.data._detail;
-        if (!p) return params.seriesName;
-        const cc = CAT_COLOR[p.cat]||'#888';
-        const lbl = LEVEL_LABEL[params.data._baseLevel] || '';
+        const d = params.data; if (!d||!d._detail) return '';
+        const p = d._detail, cc = CAT_COLOR[p.cat]||'#888';
+        const lv = d.value[2], lbl = LEVEL_LABEL[lv]||'';
         const reasons = (p.reasons||[]).join(' · ')||'—';
-        return '<div><div style="font-size:14px;font-weight:600;margin-bottom:6px">'+params.seriesName+'</div>'
+        return '<div><div style="font-size:14px;font-weight:600;margin-bottom:6px">'+d._name+'</div>'
           +'<span style="color:#666">'+p.date+'</span> · 大盘 <b>'+(p.market||'—')+'</b><br>'
           +'<div style="border-top:1px solid #f0f0f0;margin:5px 0"></div>'
           +'价格 <b style="font-size:16px">'+p.price+'</b>&nbsp;&nbsp;EMA34 '+(p.ema34||'—')+'<br>'
@@ -1015,31 +984,44 @@ function renderTimeline() {
           +'<div style="font-size:11px;color:#999;margin-top:4px">'+reasons+'</div></div>';
       }
     },
-    xAxis: { type:'category', data:allDates, axisLabel:{fontSize:11,color:'#888'}, axisLine:{lineStyle:{color:'#ddd'}}, axisTick:{show:false} },
-    yAxis: { type:'value', min:-0.5, max:6.8, interval:1,
-      axisLabel:{ fontSize:11, color:'#888', formatter:v=>LEVEL_LABEL[v]||'' },
-      splitLine:{lineStyle:{color:'#f0f0f0',type:'dashed'}}, axisLine:{show:false}, axisTick:{show:false} },
-    dataZoom: [
-      {type:'inside',xAxisIndex:0,filterMode:'none'},
-      {type:'slider',xAxisIndex:0,bottom:8,height:20,filterMode:'none',borderColor:'#ddd',fillerColor:'rgba(24,144,255,.15)'}
-    ],
-    series: series
+    xAxis: {
+      type:'category', data:allDates, position:'bottom',
+      axisLabel:{ fontSize:11, color:'#666', rotate: allDates.length>5?45:0 },
+      axisLine:{lineStyle:{color:'#ddd'}}, axisTick:{show:false},
+      splitLine:{ show:true, lineStyle:{color:'#f5f5f5'} }
+    },
+    yAxis: {
+      type:'category', data:etfNames,
+      axisLabel:{ fontSize:11, color:'#333', width:120, overflow:'truncate' },
+      axisLine:{show:false}, axisTick:{show:false},
+      splitLine:{ show:true, lineStyle:{color:'#f5f5f5'} }
+    },
+    visualMap: {
+      type:'piecewise', orient:'horizontal', left:'center', bottom:4,
+      itemWidth:18, itemHeight:12, textStyle:{fontSize:11},
+      pieces:[
+        {value:0,label:'回避',color:LEVEL_COLORS[0]},
+        {value:1,label:'观望',color:LEVEL_COLORS[1]},
+        {value:2,label:'待确认',color:LEVEL_COLORS[2]},
+        {value:3,label:'持有/观察',color:LEVEL_COLORS[3]},
+        {value:4,label:'蚂蚁上树',color:LEVEL_COLORS[4]},
+        {value:5,label:'可关注',color:LEVEL_COLORS[5]},
+        {value:6,label:'回踩买',color:LEVEL_COLORS[6]}
+      ]
+    },
+    series: [{
+      type:'heatmap', data:heatData,
+      label:{ show: allDates.length<=7, fontSize:10, color:'#fff',
+        formatter:function(p){ return LEVEL_LABEL[p.value[2]]||''; } },
+      itemStyle:{ borderColor:'#fff', borderWidth:2, borderRadius:3 },
+      emphasis:{ itemStyle:{ shadowBlur:6, shadowColor:'rgba(0,0,0,.3)' } }
+    }]
   }, true);
-  new ResizeObserver(()=>tlChart.resize()).observe(el);
+  new ResizeObserver(()=>{ if(tlChart) tlChart.resize(); }).observe(el);
 }
 
 function applyTlFilter() {
-  if (!tlChart || !tlData) return;
-  const q = document.getElementById('tl-search').value.trim().toLowerCase();
-  const legend = {};
-  tlData.etfs.forEach(etf => {
-    const key = etf.name+' '+etf.code;
-    const latest = etf.points[etf.points.length-1];
-    const matchQ = !q || etf.name.toLowerCase().includes(q) || etf.code.includes(q);
-    const matchF = tlFilter==='all' || latest.cat.startsWith(tlFilter);
-    legend[key] = matchQ && matchF;
-  });
-  tlChart.setOption({ legend:{ selected:legend } });
+  renderTimeline();
 }
 document.getElementById('tl-search').addEventListener('input', applyTlFilter);
 
