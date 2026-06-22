@@ -141,14 +141,17 @@ def _run_scan():
         scan_state["running"] = False
 
 
-# ---------- 实时行情 (通达信协议, 通过 eltdx 库连接) ----------
+# ---------- 实时行情 (通达信 TCP → 东方财富 HTTPS 双通道) ----------
 
 _tdx_client = None
 _tdx_lock = threading.Lock()
+_tdx_failed = False
 
 
 def _get_tdx_client():
-    global _tdx_client
+    global _tdx_client, _tdx_failed
+    if _tdx_failed:
+        return None
     if _tdx_client is not None:
         return _tdx_client
     with _tdx_lock:
@@ -156,10 +159,11 @@ def _get_tdx_client():
             return _tdx_client
         try:
             from eltdx import TdxClient
-            c = TdxClient(timeout=8.0, probe_hosts=True, probe_timeout=1.5)
+            c = TdxClient(timeout=6.0, probe_hosts=True, probe_timeout=1.2)
             c.connect()
             _tdx_client = c
         except Exception:
+            _tdx_failed = True
             _tdx_client = None
     return _tdx_client
 
@@ -171,10 +175,7 @@ def _tdx_code(code):
     return "sz" + code
 
 
-def fetch_realtime(codes):
-    """批量获取实时行情 (通达信协议), 返回 {code: {price, change_pct, ...}}"""
-    if not codes:
-        return {}
+def _fetch_realtime_tdx(codes):
     client = _get_tdx_client()
     if client is None:
         return {}
@@ -200,7 +201,6 @@ def fetch_realtime(codes):
                 "volume": rec.total_hand * 100 if hasattr(rec, 'total_hand') else 0,
                 "amount": rec.amount if hasattr(rec, 'amount') else 0,
                 "change_pct": change_pct,
-                "time": "",
             }
         return result
     except Exception:
@@ -209,28 +209,148 @@ def fetch_realtime(codes):
         return {}
 
 
-def _append_realtime_bar(df, code):
-    """用通达信实时行情补上 Tushare 缺失的最新交易日数据"""
+def _em_secid(code):
+    code = code.zfill(6)
+    if code.startswith(("5", "6", "9")):
+        return "1." + code
+    return "0." + code
+
+
+def _fetch_realtime_eastmoney(codes):
+    """东方财富 HTTPS 行情 (备用通道, 无需认证)"""
+    import requests as _req
+    if not codes:
+        return {}
+    secids = ",".join(_em_secid(c) for c in codes)
+    try:
+        url = (
+            "https://push2.eastmoney.com/api/qt/ulist.np/get"
+            "?fields=f12,f14,f2,f3,f15,f16,f17,f6,f5,f18"
+            "&secids=" + secids
+        )
+        r = _req.get(url, timeout=8, headers={"Referer": "https://quote.eastmoney.com"})
+        data = r.json().get("data", {})
+        rows = data.get("diff") if data else None
+        if not rows:
+            return {}
+        result = {}
+        for item in rows:
+            raw_code = item.get("f12", "")
+            price = item.get("f2")
+            if price is None or price == "-":
+                continue
+            price = float(price) / 100 if isinstance(price, int) else float(price)
+            pre_close = item.get("f18")
+            pre_close = float(pre_close) / 100 if isinstance(pre_close, int) and pre_close else 0
+            high = item.get("f15")
+            high = float(high) / 100 if isinstance(high, int) and high else price
+            low = item.get("f16")
+            low = float(low) / 100 if isinstance(low, int) and low else price
+            opn = item.get("f17")
+            opn = float(opn) / 100 if isinstance(opn, int) and opn else price
+            vol = item.get("f5", 0)
+            vol = int(vol) * 100 if vol and vol != "-" else 0
+            change_pct = item.get("f3")
+            change_pct = float(change_pct) / 100 if isinstance(change_pct, int) else (float(change_pct) if change_pct and change_pct != "-" else 0)
+            result[raw_code] = {
+                "price": price,
+                "open": opn,
+                "high": high,
+                "low": low,
+                "pre_close": pre_close,
+                "volume": vol,
+                "amount": float(item.get("f6", 0)) if item.get("f6") and item.get("f6") != "-" else 0,
+                "change_pct": round(change_pct, 2),
+            }
+        return result
+    except Exception:
+        return {}
+
+
+def fetch_realtime(codes):
+    """批量获取实时行情, 优先通达信 TCP, 失败回退东方财富 HTTPS"""
+    if not codes:
+        return {}
+    result = _fetch_realtime_tdx(codes)
+    if not result:
+        result = _fetch_realtime_eastmoney(codes)
+    return result
+
+
+def _fetch_kline_eastmoney(code, limit=5):
+    """从东方财富获取最近几根日K线 (HTTPS), 用于补齐 Tushare 延迟"""
     import pandas as pd
+    import requests as _req
+    secid = _em_secid(code)
+    try:
+        url = (
+            "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+            f"?secid={secid}&fields1=f1,f2,f3&fields2=f51,f52,f53,f54,f55,f56"
+            f"&klt=101&fqt=1&end=20500101&lmt={limit}"
+        )
+        r = _req.get(url, timeout=8, headers={"Referer": "https://quote.eastmoney.com"})
+        data = r.json().get("data", {})
+        klines = data.get("klines") if data else None
+        if not klines:
+            return pd.DataFrame()
+        rows = []
+        for line in klines:
+            parts = line.split(",")
+            if len(parts) < 6:
+                continue
+            rows.append({
+                "date": pd.Timestamp(parts[0]),
+                "open": float(parts[1]),
+                "close": float(parts[2]),
+                "high": float(parts[3]),
+                "low": float(parts[4]),
+                "volume": float(parts[5]),
+            })
+        return pd.DataFrame(rows)
+    except Exception:
+        return pd.DataFrame()
+
+
+def _append_realtime_bar(df, code):
+    """用实时行情 + 东方财富日K 补上 Tushare 缺失的交易日数据"""
+    import pandas as pd
+    last_date = df["date"].iloc[-1] if not df.empty else pd.Timestamp("2000-01-01")
+    today = pd.Timestamp(datetime.now().date())
+    if today.weekday() >= 5:
+        today = today - pd.Timedelta(days=today.weekday() - 4)
+
+    gap_days = (today - last_date).days
+    q = None
+    if gap_days > 1:
+        extra = _fetch_kline_eastmoney(code, limit=gap_days + 2)
+        if not extra.empty:
+            new_rows = extra[extra["date"] > last_date]
+            if not new_rows.empty:
+                df = pd.concat([df, new_rows], ignore_index=True)
+                last_date = df["date"].iloc[-1]
+
     live = fetch_realtime([code])
     q = live.get(code)
-    if not q or not q["price"]:
-        return df, q
-    today = pd.Timestamp(datetime.now().date())
-    last_date = df["date"].iloc[-1] if not df.empty else pd.Timestamp("2000-01-01")
-    if today.weekday() >= 5:
-        return df, q
-    if today <= last_date:
-        return df, q
-    new_row = pd.DataFrame([{
-        "date": today,
-        "open": q["open"] if q["open"] else q["price"],
-        "high": q["high"] if q["high"] else q["price"],
-        "low": q["low"] if q["low"] else q["price"],
-        "close": q["price"],
-        "volume": q["volume"],
-    }])
-    df = pd.concat([df, new_row], ignore_index=True)
+    if q and q.get("price"):
+        if today > last_date and today.weekday() < 5:
+            new_row = pd.DataFrame([{
+                "date": today,
+                "open": q["open"] if q["open"] else q["price"],
+                "high": q["high"] if q["high"] else q["price"],
+                "low": q["low"] if q["low"] else q["price"],
+                "close": q["price"],
+                "volume": q["volume"],
+            }])
+            df = pd.concat([df, new_row], ignore_index=True)
+        elif today == last_date:
+            df.loc[df.index[-1], "close"] = q["price"]
+            if q["high"] and q["high"] > df.iloc[-1]["high"]:
+                df.loc[df.index[-1], "high"] = q["high"]
+            if q["low"] and q["low"] < df.iloc[-1]["low"]:
+                df.loc[df.index[-1], "low"] = q["low"]
+            if q["volume"]:
+                df.loc[df.index[-1], "volume"] = q["volume"]
+
     return df, q
 
 
