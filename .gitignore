@@ -4,6 +4,8 @@ tushare_mcp.json
 # 生成的报告(每次运行重新产出)
 report_*.html
 report_*.xlsx
+lookup_*.html
+timeline.html
 
 # push.py 发布时本地克隆的 Pages 仓库工作副本
 .pages_publish/
