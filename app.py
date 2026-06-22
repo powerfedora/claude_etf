@@ -717,6 +717,134 @@ def _fetch_volume_ratio_eastmoney(codes):
         return {}
 
 
+PORTFOLIO_FILE = ROOT / "portfolio.json"
+
+
+@app.route("/api/portfolio")
+def api_portfolio():
+    from history import load_trades
+    if not PORTFOLIO_FILE.exists():
+        return jsonify({"error": "未找到 portfolio.json"})
+    try:
+        pf = json.loads(PORTFOLIO_FILE.read_text(encoding="utf-8"))
+    except Exception as e:
+        return jsonify({"error": f"portfolio.json 解析失败: {e}"})
+
+    positions = pf.get("positions", [])
+    cap = pf.get("capital", 0)
+
+    codes = [p["code"] for p in positions]
+    quotes = _fetch_realtime_eastmoney(codes)
+
+    try:
+        client = TushareMcpClient()
+        market = _get_market(client)
+    except Exception:
+        market = "未知"
+
+    result_positions = []
+    filled_sum = 0
+    for p in positions:
+        code = p["code"]
+        q = quotes.get(code, {})
+        price = q.get("price") or 0
+        live_change = q.get("change_pct", 0)
+        filled = p.get("filled", 0) or 0
+        filled_sum += filled
+        cost = p.get("cost", 0) or 0
+
+        cat = "—"
+        ema34 = None
+        pos_pct = None
+        verdict = ""
+        score = 0
+        try:
+            kdf = _fetch_kline_eastmoney(code, limit=200)
+            if kdf is not None and len(kdf) >= 55:
+                analysis = analyze_one(code, p.get("name", code), kdf, market)
+                cat = analysis.get("category", "—")
+                ema34 = (analysis.get("ema_day") or {}).get("EMA34")
+                pos_pct = analysis.get("pos_pct")
+                verdict = analysis.get("verdict", "")
+                score = analysis.get("score", 0)
+        except Exception:
+            pass
+
+        stop_txt = ""
+        stop_alert = ""
+        if price and ema34:
+            stop_txt = str(ema34)
+            if price < ema34:
+                stop_alert = "warn"
+                stop_alert_text = f"⚠跌破EMA34"
+            else:
+                d = (price - ema34) / ema34 * 100
+                stop_alert = "ok"
+                stop_alert_text = f"距止损 +{d:.1f}%"
+        else:
+            stop_alert = ""
+            stop_alert_text = "—"
+
+        pl_pct = None
+        if cost and price:
+            pl_pct = round((price - cost) / cost * 100, 1)
+
+        result_positions.append({
+            "code": code,
+            "name": p.get("name", ""),
+            "price": price,
+            "live_change": live_change,
+            "category": cat,
+            "score": score,
+            "pos_pct": pos_pct,
+            "target_pct": p.get("target_pct", 0),
+            "target_amt": p.get("target_amt", 0),
+            "first_buy": p.get("first_buy", 0),
+            "filled": filled,
+            "cost": cost,
+            "pl_pct": pl_pct,
+            "ema34": ema34,
+            "stop_alert": stop_alert,
+            "stop_alert_text": stop_alert_text,
+            "status": p.get("status", ""),
+            "verdict": verdict,
+        })
+
+    cash = cap - filled_sum
+    invested_pct = round(filled_sum / cap * 100, 1) if cap else 0
+
+    trades = []
+    try:
+        raw_trades = load_trades()
+        for t in reversed(raw_trades[-30:]):
+            trades.append({
+                "ts": t.get("ts", ""),
+                "code": t.get("code", ""),
+                "name": t.get("name", ""),
+                "action": t.get("action", ""),
+                "amount": t.get("amount", 0),
+                "price": t.get("price", 0),
+                "after_filled": t.get("after_filled", 0),
+                "after_cost": t.get("after_cost", 0),
+                "note": t.get("note", ""),
+            })
+    except Exception:
+        pass
+
+    return Response(
+        json.dumps({
+            "capital": cap,
+            "filled": filled_sum,
+            "invested_pct": invested_pct,
+            "cash": cash,
+            "cash_pct": pf.get("cash_pct", 0),
+            "market": market,
+            "positions": result_positions,
+            "trades": trades,
+        }, ensure_ascii=False, default=_json_default),
+        mimetype="application/json")
+
+
 # ---------- Main HTML (SPA) ----------
 
 MAIN_HTML = """<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8">
@@ -788,6 +916,7 @@ td{padding:10px;border-top:1px solid #f0f0f0;font-size:13px;vertical-align:top}
   <div class="tabs">
     <div class="tab active" data-page="report">扫描报告</div>
     <div class="tab" data-page="timeline">信号时间线</div>
+    <div class="tab" data-page="portfolio">买卖交易表</div>
     <div class="tab" data-page="lookup">个股查询</div>
   </div>
 </nav>
@@ -834,6 +963,40 @@ td{padding:10px;border-top:1px solid #f0f0f0;font-size:13px;vertical-align:top}
   <div class="card" style="padding:8px">
     <div id="timeline-chart"></div>
   </div>
+</div>
+
+<!-- ==================== 买卖交易表 ==================== -->
+<div class="page" id="page-portfolio">
+  <div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
+      <h2 style="margin:0" id="pf-title">我的组合</h2>
+      <button class="btn-primary" onclick="loadPortfolio()">刷新数据</button>
+    </div>
+    <div class="meta" id="pf-summary"></div>
+  </div>
+  <div class="card" id="pf-table-card" style="display:none">
+    <div style="overflow-x:auto">
+      <table>
+        <thead><tr>
+          <th>标的</th><th>现价</th><th>当前信号</th><th>月线位置</th>
+          <th>目标占比</th><th>目标金额</th><th>今日首笔</th>
+          <th>已建仓/浮盈</th><th>止损(EMA34)</th><th>止损提醒</th><th>状态/动作</th>
+        </tr></thead>
+        <tbody id="pf-body"></tbody>
+      </table>
+    </div>
+    <div class="meta" style="margin-top:8px">止损位取当日日线 EMA34, 每次刷新自动更新; 跌破并转死叉再离场。"已建仓/成交均价(cost)/状态" 在 portfolio.json 中维护。</div>
+  </div>
+  <div class="card" id="pf-trades-card" style="display:none">
+    <h2 id="pf-trades-title">操作记录</h2>
+    <div style="overflow-x:auto">
+      <table>
+        <thead><tr><th>时间</th><th>标的</th><th>方向</th><th>金额</th><th>成交价</th><th>后:已建仓/均价</th><th>备注</th></tr></thead>
+        <tbody id="pf-trades-body"></tbody>
+      </table>
+    </div>
+  </div>
+  <div id="pf-loading" class="meta" style="text-align:center;padding:40px">点击「刷新数据」加载组合信息</div>
 </div>
 
 <!-- ==================== 个股查询 ==================== -->
@@ -936,6 +1099,7 @@ document.querySelectorAll('.tab').forEach(tab => {
     page.classList.add('active');
     if (tab.dataset.page === 'report') loadReport();
     if (tab.dataset.page === 'timeline') loadTimeline();
+    if (tab.dataset.page === 'portfolio') loadPortfolio();
   };
 });
 
@@ -1142,6 +1306,84 @@ function applyTlFilter() {
   renderTimeline();
 }
 document.getElementById('tl-search').addEventListener('input', applyTlFilter);
+
+// ============ Portfolio ============
+let pfLoaded = false;
+function loadPortfolio() {
+  document.getElementById('pf-loading').innerHTML = '<span class="spin"></span>加载组合数据...';
+  document.getElementById('pf-table-card').style.display = 'none';
+  document.getElementById('pf-trades-card').style.display = 'none';
+  fetch('/api/portfolio').then(r=>r.json()).then(d => {
+    if (d.error) { document.getElementById('pf-loading').textContent = '❌ '+d.error; return; }
+    pfLoaded = true;
+    document.getElementById('pf-loading').style.display = 'none';
+
+    const wan = v => (v/10000).toFixed(v%10000===0?0:1)+'万';
+    document.getElementById('pf-title').textContent = '💼 我的组合';
+    document.getElementById('pf-summary').innerHTML =
+      '总 <b>'+wan(d.capital)+'</b> ｜ 已投 <b>'+wan(d.filled)+'</b>('+d.invested_pct+'%) ｜ 现金 <b>'+wan(d.cash)+'</b> ｜ 大盘 <b>'+d.market+'</b>';
+
+    // Positions table
+    let tbody = '';
+    d.positions.forEach(p => {
+      const cc = CAT_COLOR[p.category]||'#ccc';
+      const priceColor = p.live_change>=0?'#e53935':'#2196f3';
+      let plHtml = '';
+      if (p.pl_pct !== null && p.pl_pct !== undefined) {
+        const plColor = p.pl_pct>=0?'#43a047':'#e53935';
+        const plTag = p.pl_pct>=12?' 🎯达止盈':'';
+        plHtml = '<br><span style="color:'+plColor+'">'+(p.pl_pct>=0?'+':'')+p.pl_pct+'%'+plTag+'</span>';
+      }
+      let stopHtml = '—';
+      if (p.stop_alert === 'warn') stopHtml = '<span style="color:#e53935;font-weight:700">'+p.stop_alert_text+'</span>';
+      else if (p.stop_alert === 'ok') stopHtml = '<span style="color:#43a047">'+p.stop_alert_text+'</span>';
+
+      tbody += '<tr>'
+        +'<td><b>'+p.name+'</b><br><span class="meta">'+p.code+'</span></td>'
+        +'<td style="font-weight:600;color:'+priceColor+'">'+(p.price?p.price.toFixed(3):'—')+'</td>'
+        +'<td><span class="badge" style="background:'+cc+'">'+p.category+'</span></td>'
+        +'<td>'+(p.pos_pct!==null?p.pos_pct+'%':'—')+'</td>'
+        +'<td><b>'+p.target_pct+'%</b></td>'
+        +'<td>'+wan(p.target_amt)+'</td>'
+        +'<td>'+(p.first_buy?wan(p.first_buy):'—')+'</td>'
+        +'<td><b>'+wan(p.filled)+'</b>'+plHtml+'</td>'
+        +'<td>'+(p.ema34||'—')+'</td>'
+        +'<td>'+stopHtml+'</td>'
+        +'<td style="font-size:12px;line-height:1.6">'+p.status+'</td>'
+        +'</tr>';
+    });
+    // Cash row
+    tbody += '<tr style="background:#fafafa">'
+      +'<td><b>现金</b></td><td>—</td><td>—</td><td>—</td>'
+      +'<td><b>'+(d.cash_pct||'')+'%</b></td><td>—</td><td>—</td>'
+      +'<td><b>'+wan(d.cash)+'</b></td><td>—</td><td>—</td>'
+      +'<td style="font-size:12px">子弹: 回踩加仓/防守</td></tr>';
+    document.getElementById('pf-body').innerHTML = tbody;
+    document.getElementById('pf-table-card').style.display = '';
+
+    // Trades
+    if (d.trades && d.trades.length) {
+      document.getElementById('pf-trades-title').textContent = '📜 操作记录 ('+d.trades.length+' 笔)';
+      let trows = '';
+      d.trades.forEach(t => {
+        const actColor = t.action==='sell'?'#e53935':'#43a047';
+        const actLabel = t.action==='sell'?'卖出':'买入';
+        trows += '<tr>'
+          +'<td class="meta">'+t.ts+'</td>'
+          +'<td><b>'+t.name+'</b> <span class="meta">'+t.code+'</span></td>'
+          +'<td style="color:'+actColor+';font-weight:600">'+actLabel+'</td>'
+          +'<td>'+wan(t.amount)+'</td>'
+          +'<td>'+t.price+'</td>'
+          +'<td>'+wan(t.after_filled)+'/'+t.after_cost+'</td>'
+          +'<td class="meta">'+t.note+'</td></tr>';
+      });
+      document.getElementById('pf-trades-body').innerHTML = trows;
+      document.getElementById('pf-trades-card').style.display = '';
+    }
+  }).catch(e => {
+    document.getElementById('pf-loading').textContent = '❌ 加载失败: '+e;
+  });
+}
 
 // ============ Lookup ============
 let lookupMainChart = null;
