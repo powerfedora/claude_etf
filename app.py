@@ -617,6 +617,106 @@ def api_lookup():
         return jsonify({"error": str(e)})
 
 
+@app.route("/api/constituents")
+def api_constituents():
+    code = request.args.get("code", "").strip().zfill(6)
+    if not code or len(code) != 6:
+        return jsonify({"error": "无效代码"}), 400
+
+    stocks = _fetch_etf_constituents(code)
+    if not stocks:
+        return jsonify({"stocks": [], "msg": "未找到成份股数据"})
+
+    stock_codes = [s["code"] for s in stocks]
+    quotes = _fetch_realtime_eastmoney(stock_codes)
+    for s in stocks:
+        q = quotes.get(s["code"], {})
+        s["price"] = q.get("price", 0)
+        s["change"] = q.get("change_pct", 0)
+        s["volume"] = q.get("volume", 0)
+        s["amount"] = q.get("amount", 0)
+        s["volume_ratio"] = 0
+
+    vr_map = _fetch_volume_ratio_eastmoney(stock_codes)
+    for s in stocks:
+        s["volume_ratio"] = vr_map.get(s["code"], 0)
+
+    try:
+        client = TushareMcpClient()
+        market = _get_market(client)
+    except Exception:
+        market = "未知"
+
+    for s in stocks:
+        try:
+            kdf = _fetch_kline_eastmoney(s["code"], limit=200)
+            if kdf is not None and len(kdf) >= 55:
+                result = analyze_one(s["code"], s["name"], kdf, market)
+                s["category"] = result.get("category", "—")
+                s["score"] = result.get("score", 0)
+                s["verdict"] = result.get("verdict", "")
+            else:
+                s["category"] = "—"
+                s["score"] = 0
+                s["verdict"] = "K线数据不足"
+        except Exception:
+            s["category"] = "—"
+            s["score"] = 0
+            s["verdict"] = ""
+
+    return Response(
+        json.dumps({"stocks": stocks}, ensure_ascii=False, default=_json_default),
+        mimetype="application/json")
+
+
+def _fetch_etf_constituents(code):
+    import requests as _req
+    secid = _em_secid(code)
+    try:
+        url = (
+            "https://push2.eastmoney.com/api/qt/clist/get"
+            f"?np=1&fltt=2&invt=2&fid=f3&fs=b:{secid}&pn=1&pz=200"
+            "&fields=f12,f14"
+        )
+        r = _req.get(url, timeout=10, headers={
+            "Referer": "https://quote.eastmoney.com",
+            "User-Agent": "Mozilla/5.0",
+        })
+        data = r.json().get("data", {})
+        rows = data.get("diff") if data else None
+        if not rows:
+            return []
+        return [{"code": str(item.get("f12", "")), "name": item.get("f14", "")} for item in rows if item.get("f12")]
+    except Exception:
+        return []
+
+
+def _fetch_volume_ratio_eastmoney(codes):
+    import requests as _req
+    if not codes:
+        return {}
+    secids = ",".join(_em_secid(c) for c in codes)
+    try:
+        url = (
+            "https://push2.eastmoney.com/api/qt/ulist.np/get"
+            "?fields=f12,f10&secids=" + secids
+        )
+        r = _req.get(url, timeout=8, headers={"Referer": "https://quote.eastmoney.com"})
+        data = r.json().get("data", {})
+        rows = data.get("diff") if data else None
+        if not rows:
+            return {}
+        result = {}
+        for item in rows:
+            c = item.get("f12", "")
+            vr = item.get("f10")
+            if c and vr and vr != "-":
+                result[c] = round(float(vr) / 100, 2) if isinstance(vr, int) else round(float(vr), 2)
+        return result
+    except Exception:
+        return {}
+
+
 # ---------- Main HTML (SPA) ----------
 
 MAIN_HTML = """<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8">
@@ -655,7 +755,6 @@ td{padding:10px;border-top:1px solid #f0f0f0;font-size:13px;vertical-align:top}
 .fbtn.active{background:#1890ff;color:#fff;border-color:#1890ff}
 #lookup-input{width:220px}
 #lookup-chart{width:100%;height:480px}
-#lookup-vol{width:100%;height:120px}
 #lookup-wrap{display:flex;gap:16px;align-items:flex-start}
 #lookup-sidebar{width:200px;flex-shrink:0;position:sticky;top:70px}
 #lookup-main{flex:1;min-width:0}
@@ -768,11 +867,30 @@ td{padding:10px;border-top:1px solid #f0f0f0;font-size:13px;vertical-align:top}
         <div class="card">
           <h2>K线 + EMA 13/34/55 (近120日)</h2>
           <div id="lookup-chart"></div>
-          <div id="lookup-vol"></div>
         </div>
         <div class="card">
           <h2>详细分析</h2>
           <table id="lookup-detail"></table>
+        </div>
+        <div class="card" id="constituents-card" style="display:none">
+          <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:12px">
+            <h2 style="margin:0">成份股明细</h2>
+            <span class="meta" id="const-meta"></span>
+          </div>
+          <div style="overflow-x:auto">
+            <table id="constituents-table">
+              <thead><tr>
+                <th style="cursor:pointer" onclick="sortConst('name')">名称 ↕</th>
+                <th style="cursor:pointer" onclick="sortConst('code')">代码 ↕</th>
+                <th style="cursor:pointer;text-align:right" onclick="sortConst('price')">现价 ↕</th>
+                <th style="cursor:pointer;text-align:right" onclick="sortConst('change')">涨幅% ↕</th>
+                <th style="cursor:pointer;text-align:right" onclick="sortConst('volume_ratio')">量比 ↕</th>
+                <th style="cursor:pointer" onclick="sortConst('category')">操作建议 ↕</th>
+                <th style="cursor:pointer;text-align:right" onclick="sortConst('score')">打分 ↕</th>
+              </tr></thead>
+              <tbody id="const-body"></tbody>
+            </table>
+          </div>
         </div>
       </div>
     </div>
@@ -1026,7 +1144,7 @@ function applyTlFilter() {
 document.getElementById('tl-search').addEventListener('input', applyTlFilter);
 
 // ============ Lookup ============
-let lookupMainChart = null, lookupVolChart = null;
+let lookupMainChart = null;
 let lookupHistory = JSON.parse(localStorage.getItem('lookupHistory')||'[]');
 let activeCode = '';
 
@@ -1198,9 +1316,7 @@ function renderLookup(r, chart) {
   const upC='#e53935', dnC='#2196f3';
 
   const el1 = document.getElementById('lookup-chart');
-  const el2 = document.getElementById('lookup-vol');
   if (!lookupMainChart) lookupMainChart = echarts.init(el1);
-  if (!lookupVolChart) lookupVolChart = echarts.init(el2);
 
   lookupMainChart.setOption({
     animation:false,
@@ -1217,8 +1333,6 @@ function renderLookup(r, chart) {
           if(p.seriesType==='candlestick'){const v=p.data;s+='开 '+v[1]+' 收 '+v[2]+'<br>低 '+v[3]+' 高 '+v[4]+'<br>';}
           else s+='<span style="color:'+p.color+'">●</span> '+p.seriesName+': <b>'+p.data+'</b><br>';
         });
-        const idx=dates.indexOf(params[0].axisValue);
-        if(idx>=0)s+='成交量: '+(chart[idx].volume/10000).toFixed(0)+'万';
         return s;
       }
     },
@@ -1230,24 +1344,65 @@ function renderLookup(r, chart) {
       {name:'EMA55',type:'line',data:chart.map(r=>r.ema55),symbol:'none',lineStyle:{width:1.5,color:'#66bb6a'},z:5},
     ]
   }, true);
+  setTimeout(()=>{lookupMainChart.resize();},100);
 
-  lookupVolChart.setOption({
-    animation:false,
-    grid:{left:60,right:20,top:5,bottom:24},
-    xAxis:{type:'category',data:dates,boundaryGap:true,axisLabel:{show:false},axisTick:{show:false},axisLine:{lineStyle:{color:'#eee'}}},
-    yAxis:{scale:true,show:false},
-    series:[{type:'bar',data:chart.map(r=>({value:r.volume,itemStyle:{color:r.close>=r.open?upC:dnC,opacity:.5}})),barWidth:'60%'}]
-  }, true);
+  // Load constituents for ETF
+  if (r._type === 'ETF') {
+    document.getElementById('constituents-card').style.display = '';
+    document.getElementById('const-meta').innerHTML = '<span class="spin"></span>加载成份股...';
+    document.getElementById('const-body').innerHTML = '';
+    fetch('/api/constituents?code='+encodeURIComponent(r.code))
+      .then(res=>res.json()).then(d => {
+        if (d.stocks && d.stocks.length) {
+          constData = d.stocks;
+          constSortKey = 'change'; constSortAsc = false;
+          constData.sort((a,b) => (b.change||0) - (a.change||0));
+          document.getElementById('const-meta').textContent = d.stocks.length + ' 只成份股';
+          renderConstTable();
+        } else {
+          document.getElementById('const-meta').textContent = d.msg || '未找到成份股';
+        }
+      }).catch(()=>{ document.getElementById('const-meta').textContent = '加载失败'; });
+  } else {
+    document.getElementById('constituents-card').style.display = 'none';
+  }
+}
 
-  echarts.connect([lookupMainChart, lookupVolChart]);
-  setTimeout(()=>{lookupMainChart.resize();lookupVolChart.resize();},100);
+let constData = [], constSortKey = 'change', constSortAsc = false;
+
+function sortConst(key) {
+  if (constSortKey === key) constSortAsc = !constSortAsc;
+  else { constSortKey = key; constSortAsc = key === 'name' || key === 'code'; }
+  const dir = constSortAsc ? 1 : -1;
+  constData.sort((a,b) => {
+    let va = a[key], vb = b[key];
+    if (typeof va === 'string') return va.localeCompare(vb,'zh') * dir;
+    return ((va||0) - (vb||0)) * dir;
+  });
+  renderConstTable();
+}
+
+function renderConstTable() {
+  document.getElementById('const-body').innerHTML = constData.map(s => {
+    const cc = CAT_COLOR[s.category]||'#ccc';
+    const chgColor = s.change > 0 ? '#e53935' : (s.change < 0 ? '#2196f3' : '#333');
+    const chgSign = s.change > 0 ? '+' : '';
+    return '<tr style="cursor:pointer" onclick="document.getElementById(\'lookup-input\').value=\''+s.code+'\';doLookup()">'
+      +'<td>'+s.name+'</td>'
+      +'<td class="meta">'+s.code+'</td>'
+      +'<td style="text-align:right;font-weight:600">'+((s.price||0).toFixed(2))+'</td>'
+      +'<td style="text-align:right;color:'+chgColor+';font-weight:600">'+chgSign+(s.change||0).toFixed(2)+'%</td>'
+      +'<td style="text-align:right">'+(s.volume_ratio||'—')+'</td>'
+      +'<td><span class="badge" style="background:'+cc+'">'+( s.category||'—')+'</span></td>'
+      +'<td style="text-align:right;font-weight:600">'+(s.score||0)+'</td>'
+      +'</tr>';
+  }).join('');
 }
 
 // ============ Init ============
 window.addEventListener('resize', () => {
   if (tlChart) tlChart.resize();
   if (lookupMainChart) lookupMainChart.resize();
-  if (lookupVolChart) lookupVolChart.resize();
 });
 loadReport();
 let scan_state_running = false;
