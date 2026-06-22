@@ -928,8 +928,30 @@ function renderTimeline() {
   if (!tlChart) tlChart = echarts.init(el);
 
   const allDates = tlData.days;
+
+  // Build jitter offsets: group ETFs by their latest cat level, spread within ±0.35
+  const levelGroups = {};
+  tlData.etfs.forEach((etf, i) => {
+    const latest = etf.points[etf.points.length - 1];
+    const lv = CAT_LEVEL[latest.cat] ?? 1;
+    if (!levelGroups[lv]) levelGroups[lv] = [];
+    levelGroups[lv].push(i);
+  });
+  const jitterMap = {};
+  Object.keys(levelGroups).forEach(lv => {
+    const indices = levelGroups[lv];
+    const n = indices.length;
+    indices.forEach((idx, rank) => {
+      jitterMap[idx] = n <= 1 ? 0 : (rank / (n - 1) - 0.5) * 0.7;
+    });
+  });
+
+  const BAND_COLORS = ['rgba(187,187,187,.08)','rgba(136,136,136,.08)','rgba(255,152,0,.06)',
+    'rgba(251,140,0,.06)','rgba(255,87,34,.06)','rgba(229,57,53,.06)','rgba(229,57,53,.10)'];
+
   const series = tlData.etfs.map((etf,i) => {
     const map = {}; etf.points.forEach(p => { map[p.date] = p; });
+    const offset = jitterMap[i] || 0;
     return {
       name: etf.name+' '+etf.code,
       type: 'line', symbol: 'circle', symbolSize: 8,
@@ -941,17 +963,33 @@ function renderTimeline() {
       data: allDates.map(d => {
         const p = map[d];
         if (!p) return null;
-        return { value: CAT_LEVEL[p.cat]??1, _detail: p };
+        return { value: (CAT_LEVEL[p.cat]??1) + offset, _detail: p, _baseLevel: CAT_LEVEL[p.cat]??1 };
       })
     };
   });
+
+  // Add invisible markArea series for band backgrounds
+  const bandSeries = {
+    name: '_bands', type: 'line', data: [],
+    markArea: {
+      silent: true,
+      data: [0,1,2,3,4,5,6].map(lv => [{
+        yAxis: lv - 0.45,
+        itemStyle: { color: BAND_COLORS[lv] || 'rgba(0,0,0,.03)' }
+      }, {
+        yAxis: lv + 0.45
+      }])
+    }
+  };
+  series.unshift(bandSeries);
 
   tlChart.setOption({
     grid: { top:80, right:30, bottom:50, left:70 },
     legend: {
       type:'scroll', top:5, left:10, right:10,
       textStyle:{fontSize:11}, pageIconSize:12,
-      selector:[{type:'all',title:'全选'},{type:'inverse',title:'反选'}]
+      selector:[{type:'all',title:'全选'},{type:'inverse',title:'反选'}],
+      data: tlData.etfs.map((etf,i) => etf.name+' '+etf.code)
     },
     tooltip: {
       trigger:'item', confine:true,
@@ -962,12 +1000,13 @@ function renderTimeline() {
         const p = params.data && params.data._detail;
         if (!p) return params.seriesName;
         const cc = CAT_COLOR[p.cat]||'#888';
+        const lbl = LEVEL_LABEL[params.data._baseLevel] || '';
         const reasons = (p.reasons||[]).join(' · ')||'—';
         return '<div><div style="font-size:14px;font-weight:600;margin-bottom:6px">'+params.seriesName+'</div>'
           +'<span style="color:#666">'+p.date+'</span> · 大盘 <b>'+(p.market||'—')+'</b><br>'
           +'<div style="border-top:1px solid #f0f0f0;margin:5px 0"></div>'
           +'价格 <b style="font-size:16px">'+p.price+'</b>&nbsp;&nbsp;EMA34 '+(p.ema34||'—')+'<br>'
-          +'分类 <span class="badge" style="background:'+cc+'">'+p.cat+'</span>'
+          +'分类 <span class="badge" style="background:'+cc+'">'+p.cat+'</span> ('+lbl+')'
           +'&nbsp;&nbsp;打分 <b>'+p.score+'</b>&nbsp;&nbsp;位置 '+p.pos+'%<br>'
           +'月 '+(p.month_state||'—')+' · 周 '+(p.week_state||'—')+'<br>'
           +'日 '+(p.day_state||'—')+' ('+(p.day_cross||'—')+')<br>'
@@ -977,9 +1016,9 @@ function renderTimeline() {
       }
     },
     xAxis: { type:'category', data:allDates, axisLabel:{fontSize:11,color:'#888'}, axisLine:{lineStyle:{color:'#ddd'}}, axisTick:{show:false} },
-    yAxis: { type:'value', min:-0.3, max:6.5, interval:1,
+    yAxis: { type:'value', min:-0.5, max:6.8, interval:1,
       axisLabel:{ fontSize:11, color:'#888', formatter:v=>LEVEL_LABEL[v]||'' },
-      splitLine:{lineStyle:{color:'#f0f0f0'}}, axisLine:{show:false}, axisTick:{show:false} },
+      splitLine:{lineStyle:{color:'#f0f0f0',type:'dashed'}}, axisLine:{show:false}, axisTick:{show:false} },
     dataZoom: [
       {type:'inside',xAxisIndex:0,filterMode:'none'},
       {type:'slider',xAxisIndex:0,bottom:8,height:20,filterMode:'none',borderColor:'#ddd',fillerColor:'rgba(24,144,255,.15)'}
