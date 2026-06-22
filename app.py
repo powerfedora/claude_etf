@@ -991,7 +991,7 @@ function renderTimeline() {
       splitLine:{ show:true, lineStyle:{color:'#f5f5f5'} }
     },
     yAxis: {
-      type:'category', data:etfNames,
+      type:'category', data:etfNames, inverse:true,
       axisLabel:{ fontSize:11, color:'#333', width:120, overflow:'truncate' },
       axisLine:{show:false}, axisTick:{show:false},
       splitLine:{ show:true, lineStyle:{color:'#f5f5f5'} }
