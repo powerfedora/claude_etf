@@ -421,12 +421,120 @@ def api_timeline():
     return jsonify({"days": days, "etfs": etf_list})
 
 
+# ---------- 股票名称搜索 (拼音首字母 + 中文 + 代码) ----------
+
+_stock_list = []
+_stock_list_lock = threading.Lock()
+_stock_list_loaded = False
+
+
+def _pinyin_initials(name):
+    try:
+        from pypinyin import pinyin, Style
+        return "".join(p[0][0] for p in pinyin(name, style=Style.FIRST_LETTER)).lower()
+    except Exception:
+        return ""
+
+
+def _load_stock_list():
+    global _stock_list, _stock_list_loaded
+    if _stock_list_loaded:
+        return _stock_list
+    with _stock_list_lock:
+        if _stock_list_loaded:
+            return _stock_list
+        items = []
+        etf_codes = set()
+        try:
+            for code, name in _load_list():
+                py = _pinyin_initials(name)
+                items.append({"code": code, "name": name, "py": py, "type": "ETF"})
+                etf_codes.add(code)
+        except Exception:
+            pass
+        try:
+            client = TushareMcpClient()
+            for api_name, stype in [("stock_basic", "个股")]:
+                rows = client.call_tool(api_name, {
+                    "exchange": "",
+                    "list_status": "L",
+                    "fields": ["ts_code", "name"],
+                })
+                for r in (rows or []):
+                    code = r.get("ts_code", "")[:6]
+                    name = r.get("name", "")
+                    if code and name and code not in etf_codes:
+                        py = _pinyin_initials(name)
+                        items.append({"code": code, "name": name, "py": py, "type": stype})
+        except Exception:
+            pass
+        try:
+            rows = client.call_tool("fund_basic", {
+                "market": "E",
+                "status": "L",
+                "fields": ["ts_code", "name"],
+            })
+            for r in (rows or []):
+                code = r.get("ts_code", "")[:6]
+                name = r.get("name", "")
+                if code and name and code not in etf_codes:
+                    py = _pinyin_initials(name)
+                    items.append({"code": code, "name": name, "py": py, "type": "ETF"})
+        except Exception:
+            pass
+        _stock_list = items
+        _stock_list_loaded = True
+    return _stock_list
+
+
+def _do_load_stock_list_bg():
+    _load_stock_list()
+
+threading.Thread(target=_do_load_stock_list_bg, daemon=True).start()
+
+
+@app.route("/api/suggest")
+def api_suggest():
+    q = request.args.get("q", "").strip().lower()
+    if not q or len(q) < 1:
+        return jsonify([])
+    stocks = _load_stock_list()
+    results = []
+    for s in stocks:
+        if (q in s["code"]
+                or q in s["name"].lower()
+                or q in s["py"]
+                or s["py"].startswith(q)):
+            results.append(s)
+            if len(results) >= 15:
+                break
+    return jsonify(results)
+
+
+def _resolve_code(raw):
+    """如果输入不是纯数字, 尝试通过名称/拼音匹配到股票代码"""
+    raw = raw.strip()
+    if raw.isdigit():
+        return raw.zfill(6), None
+    q = raw.lower()
+    stocks = _load_stock_list()
+    for s in stocks:
+        if s["name"] == raw or s["py"] == q:
+            return s["code"], s["name"]
+    for s in stocks:
+        if q in s["name"].lower() or s["py"].startswith(q):
+            return s["code"], s["name"]
+    return raw.zfill(6), None
+
+
 @app.route("/api/lookup")
 def api_lookup():
-    code = request.args.get("code", "").strip().zfill(6)
-    name = request.args.get("name", "") or code
-    if len(code) != 6:
-        return jsonify({"error": "请输入6位代码"}), 400
+    raw_input = request.args.get("code", "").strip()
+    name_input = request.args.get("name", "").strip()
+    code, resolved_name = _resolve_code(raw_input)
+    name = name_input or resolved_name or code
+    if len(code) != 6 or not code.isdigit():
+        return jsonify({"error": "未找到匹配的股票, 请输入6位代码或选择建议项"}), 400
 
     try:
         client = TushareMcpClient()
@@ -504,6 +612,16 @@ td{padding:10px;border-top:1px solid #f0f0f0;font-size:13px;vertical-align:top}
 #lookup-history li:hover .h-remove{visibility:visible}
 #lookup-history .h-remove:hover{color:#e53935}
 @media(max-width:768px){#lookup-wrap{flex-direction:column}#lookup-sidebar{width:100%;position:static}#lookup-history{max-height:160px}}
+.suggest-wrap{position:relative;display:inline-block}
+.suggest-drop{position:absolute;top:100%;left:0;width:320px;max-height:300px;overflow-y:auto;background:#fff;border:1px solid #e0e0e0;border-radius:8px;box-shadow:0 6px 20px rgba(0,0,0,.12);z-index:200;display:none;margin-top:4px}
+.suggest-drop.show{display:block}
+.suggest-item{padding:8px 14px;cursor:pointer;display:flex;justify-content:space-between;align-items:center;font-size:13px;border-bottom:1px solid #f5f5f5}
+.suggest-item:last-child{border-bottom:none}
+.suggest-item:hover,.suggest-item.active{background:#e6f7ff}
+.suggest-item .s-name{font-weight:600}
+.suggest-item .s-code{color:#888;font-size:12px;margin-left:6px}
+.suggest-item .s-type{color:#bbb;font-size:11px}
+.suggest-item em{font-style:normal;color:#1890ff;font-weight:600}
 #timeline-chart{width:100%;height:calc(100vh - 180px);min-height:500px}
 .spin{display:inline-block;width:16px;height:16px;border:2px solid #ddd;border-top-color:#1890ff;border-radius:50%;animation:spin .6s linear infinite;vertical-align:middle;margin-right:6px}
 @keyframes spin{to{transform:rotate(360deg)}}
@@ -565,8 +683,11 @@ td{padding:10px;border-top:1px solid #f0f0f0;font-size:13px;vertical-align:top}
   <div class="card">
     <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
       <h2 style="margin:0;white-space:nowrap">个股 / ETF 查询</h2>
-      <input type="text" id="lookup-input" placeholder="输入6位代码, 如 601919 或 510210">
-      <input type="text" id="lookup-name" placeholder="名称(可选)" style="width:140px">
+      <div class="suggest-wrap">
+        <input type="text" id="lookup-input" placeholder="代码 / 拼音首字母 / 中文名" autocomplete="off">
+        <div class="suggest-drop" id="suggest-code"></div>
+      </div>
+      <input type="hidden" id="lookup-name" value="">
       <button class="btn-primary" id="btn-lookup" onclick="doLookup()">查询</button>
       <span class="meta" id="lookup-status"></span>
     </div>
@@ -820,6 +941,68 @@ let lookupMainChart = null, lookupVolChart = null;
 let lookupHistory = JSON.parse(localStorage.getItem('lookupHistory')||'[]');
 let activeCode = '';
 
+// ---- Autocomplete ----
+let suggestTimer = null;
+let suggestIdx = -1;
+const suggestEl = document.getElementById('suggest-code');
+const inputEl = document.getElementById('lookup-input');
+
+function highlightMatch(text, q) {
+  if (!q) return text;
+  const i = text.toLowerCase().indexOf(q.toLowerCase());
+  if (i < 0) return text;
+  return text.slice(0,i)+'<em>'+text.slice(i,i+q.length)+'</em>'+text.slice(i+q.length);
+}
+
+function showSuggestions(items, q) {
+  if (!items.length) { suggestEl.classList.remove('show'); return; }
+  suggestIdx = -1;
+  suggestEl.innerHTML = items.map((s,i) =>
+    '<div class="suggest-item" data-idx="'+i+'" data-code="'+s.code+'" data-name="'+s.name+'">'
+    +'<div><span class="s-name">'+highlightMatch(s.name, q)+'</span><span class="s-code">'+highlightMatch(s.code, q)+'</span></div>'
+    +'<span class="s-type">'+s.type+'</span></div>'
+  ).join('');
+  suggestEl.classList.add('show');
+  suggestEl.querySelectorAll('.suggest-item').forEach(el => {
+    el.onmousedown = e => {
+      e.preventDefault();
+      pickSuggestion(el.dataset.code, el.dataset.name);
+    };
+  });
+}
+
+function pickSuggestion(code, name) {
+  inputEl.value = code;
+  document.getElementById('lookup-name').value = name;
+  suggestEl.classList.remove('show');
+  doLookup();
+}
+
+inputEl.addEventListener('input', () => {
+  const q = inputEl.value.trim();
+  if (q.length < 1) { suggestEl.classList.remove('show'); return; }
+  if (/^\d{6}$/.test(q)) { suggestEl.classList.remove('show'); return; }
+  clearTimeout(suggestTimer);
+  suggestTimer = setTimeout(() => {
+    fetch('/api/suggest?q='+encodeURIComponent(q))
+      .then(r=>r.json()).then(items => showSuggestions(items, q))
+      .catch(()=>{});
+  }, 200);
+});
+
+inputEl.addEventListener('keydown', e => {
+  const items = suggestEl.querySelectorAll('.suggest-item');
+  if (suggestEl.classList.contains('show') && items.length) {
+    if (e.key==='ArrowDown') { e.preventDefault(); suggestIdx = Math.min(suggestIdx+1, items.length-1); items.forEach((el,i) => el.classList.toggle('active', i===suggestIdx)); return; }
+    if (e.key==='ArrowUp') { e.preventDefault(); suggestIdx = Math.max(suggestIdx-1, 0); items.forEach((el,i) => el.classList.toggle('active', i===suggestIdx)); return; }
+    if (e.key==='Enter' && suggestIdx>=0) { e.preventDefault(); const el=items[suggestIdx]; pickSuggestion(el.dataset.code, el.dataset.name); return; }
+    if (e.key==='Escape') { suggestEl.classList.remove('show'); return; }
+  }
+  if (e.key==='Enter') doLookup();
+});
+
+inputEl.addEventListener('blur', () => { setTimeout(()=>suggestEl.classList.remove('show'), 150); });
+
 function saveHistory() { localStorage.setItem('lookupHistory', JSON.stringify(lookupHistory)); }
 
 function renderHistory() {
@@ -861,8 +1044,6 @@ function lookupFromHistory(idx) {
 document.getElementById('history-clear').onclick = () => {
   lookupHistory = []; saveHistory(); renderHistory();
 };
-
-document.getElementById('lookup-input').addEventListener('keydown', e => { if(e.key==='Enter') doLookup(); });
 
 function doLookup() {
   const code = document.getElementById('lookup-input').value.trim();
