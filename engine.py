@@ -140,6 +140,24 @@ def detect_stick(d: pd.DataFrame, threshold=STICK_THRESHOLD, window=STICK_WINDOW
     return is_stick, direction, round(min_spread * 100, 2)
 
 
+def _has_confirmed_breakout(d: pd.DataFrame, window: int) -> bool:
+    """回溯窗口内是否存在某天同时满足: 价格在粘合带上方 + 放量 + 非首日突破。
+    即之前已经有过一次完整的确认突破,后续不应因缩量而回退。"""
+    cols = [f"ema{EMA_FAST}", f"ema{EMA_MID}", f"ema{EMA_SLOW}"]
+    for i in range(-min(window, len(d)-2), -1):
+        row = d.iloc[i]
+        prev_row = d.iloc[i - 1]
+        band_top = max(row[cols[0]], row[cols[1]], row[cols[2]])
+        prev_band_top = max(prev_row[cols[0]], prev_row[cols[1]], prev_row[cols[2]])
+        above = row["close"] > band_top * (1 + STICK_BREAK)
+        prev_above = prev_row["close"] > prev_band_top * (1 + STICK_BREAK)
+        vol_ma = d["volume"].iloc[max(0, i + len(d) - VOL_LOOKBACK):i + len(d)].mean()
+        vol_up = row["volume"] > vol_ma if vol_ma > 0 else False
+        if above and prev_above and vol_up:
+            return True
+    return False
+
+
 def analyze_one(code: str, name: str, df_daily: pd.DataFrame, market_state: str) -> dict:
     """
     分析单只ETF。
@@ -223,11 +241,15 @@ def analyze_one(code: str, name: str, df_daily: pd.DataFrame, market_state: str)
             category = "回避-向下变盘"
             verdict = f"三线粘合后向下跌破(最小间距{stick_spread}%), 向下变盘, 规避"
         elif stick_dir == "向上":
-            # 改进: 粘合向上突破需 ①放量确认 ②次日确认(非首日突破)
+            # 检查粘合窗口内是否已有确认突破日(放量+非首日), 有则不再降级
+            confirmed_before = _has_confirmed_breakout(d, STICK_WINDOW)
             prev = d.iloc[-2]
             prev_band_top = max(prev[f"ema{EMA_FAST}"], prev[f"ema{EMA_MID}"], prev[f"ema{EMA_SLOW}"])
             first_day_break = prev["close"] <= prev_band_top * (1 + STICK_BREAK)
-            if not is_volume_up:
+            if confirmed_before:
+                category = "可关注-向上变盘"
+                verdict = f"三线粘合向上突破已确认(窗口内有放量突破日, 最小间距{stick_spread}%, 打分{score}), 持有/加仓候选"
+            elif not is_volume_up:
                 category = "观望-变盘待确认"
                 verdict = f"三线粘合向上突破但缺量(最小间距{stick_spread}%), 等放量确认再进场"
             elif first_day_break:
