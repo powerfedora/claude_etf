@@ -643,7 +643,8 @@ td{padding:10px;border-top:1px solid #f0f0f0;font-size:13px;vertical-align:top}
         <h2 style="display:inline">扫描报告</h2>
         <span class="meta" id="report-meta"></span>
       </div>
-      <div>
+      <div style="display:flex;align-items:center;gap:10px">
+        <span class="meta" id="refresh-timer"></span>
         <button class="btn-primary" id="btn-scan" onclick="startScan()">刷新全量扫描</button>
       </div>
     </div>
@@ -801,6 +802,7 @@ let scanPoll = null;
 function startScan() {
   fetch('/api/scan',{method:'POST'}).then(r=>r.json()).then(d => {
     if (d.status==='already_running') return;
+    scan_state_running = true;
     document.getElementById('btn-scan').disabled = true;
     document.getElementById('scan-progress').style.display = '';
     scanPoll = setInterval(pollScan, 1500);
@@ -814,6 +816,7 @@ function pollScan() {
       ? '<span class="spin"></span>' + d.message
       : '✅ ' + d.message;
     if (!d.running) {
+      scan_state_running = false;
       clearInterval(scanPoll);
       document.getElementById('btn-scan').disabled = false;
       setTimeout(() => { document.getElementById('scan-progress').style.display='none'; }, 3000);
@@ -1161,6 +1164,22 @@ window.addEventListener('resize', () => {
   if (lookupVolChart) lookupVolChart.resize();
 });
 loadReport();
+let scan_state_running = false;
+let refreshCountdown = 60;
+setInterval(() => {
+  refreshCountdown--;
+  const el = document.getElementById('refresh-timer');
+  const reportActive = document.getElementById('page-report').classList.contains('active');
+  if (refreshCountdown <= 0) {
+    refreshCountdown = 60;
+    if (reportActive && !scan_state_running) loadReport();
+  }
+  if (reportActive && !scan_state_running) {
+    el.textContent = refreshCountdown + 's 后刷新';
+  } else {
+    el.textContent = '';
+  }
+}, 1000);
 </script></body></html>"""
 
 
