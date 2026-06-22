@@ -1,7 +1,7 @@
 """
-ETF 信号时间线: 交互式折线图, 按ETF分类展示每次扫描的历史信号变化
-=================================================================
-每只ETF一张折线图, X轴=扫描日期, Y轴=信号等级(0-6),
+ETF 信号时间线: 一张大折线图, 所有ETF作为不同折线
+================================================================
+X轴=扫描日期, Y轴=信号等级(0-6), 每只ETF一条线,
 鼠标悬停显示完整分析(分类/打分/结论/买卖理由等)。
 """
 import json
@@ -98,63 +98,164 @@ def _build_html(ts, n_etfs, n_days, data_json, cat_color_json, cat_level_json):
 <style>
 *{{box-sizing:border-box;margin:0;padding:0}}
 body{{font-family:-apple-system,"PingFang SC","Helvetica Neue",sans-serif;
-      background:#f0f2f5;color:#1d1d1f;min-height:100vh}}
-.header{{background:#fff;padding:16px 24px;box-shadow:0 1px 4px rgba(0,0,0,.08);
-         position:sticky;top:0;z-index:100}}
+      background:#f5f5f7;color:#1d1d1f;display:flex;flex-direction:column;height:100vh;overflow:hidden}}
+.header{{background:#fff;padding:14px 24px;box-shadow:0 1px 4px rgba(0,0,0,.08);flex-shrink:0;z-index:10}}
 .header h1{{font-size:20px;margin-bottom:4px}}
-.meta{{color:#888;font-size:13px;margin-bottom:12px}}
+.meta{{color:#888;font-size:13px;margin-bottom:10px}}
 .toolbar{{display:flex;flex-wrap:wrap;gap:10px;align-items:center}}
-#search{{flex:1;min-width:200px;max-width:360px;padding:8px 14px;border:1px solid #ddd;
-         border-radius:8px;font-size:14px;outline:none;transition:border .2s}}
+#search{{width:280px;padding:7px 14px;border:1px solid #ddd;border-radius:8px;font-size:13px;outline:none}}
 #search:focus{{border-color:#1890ff}}
 .filters{{display:flex;flex-wrap:wrap;gap:6px}}
 .fbtn{{padding:4px 12px;border-radius:16px;font-size:12px;border:1px solid #ddd;
-       background:#fff;cursor:pointer;transition:all .15s;white-space:nowrap}}
+       background:#fff;cursor:pointer;transition:all .15s;white-space:nowrap;user-select:none}}
 .fbtn:hover{{border-color:#1890ff;color:#1890ff}}
 .fbtn.active{{background:#1890ff;color:#fff;border-color:#1890ff}}
-.grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(370px,1fr));
-       gap:16px;padding:20px 24px}}
-.card{{background:#fff;border-radius:12px;overflow:hidden;
-       box-shadow:0 1px 3px rgba(0,0,0,.06);transition:box-shadow .2s}}
-.card:hover{{box-shadow:0 4px 12px rgba(0,0,0,.12)}}
-.card-head{{padding:12px 16px 8px;display:flex;justify-content:space-between;align-items:flex-start}}
-.card-title{{font-size:15px;font-weight:600}}
-.card-code{{font-size:11px;color:#aaa;margin-top:2px}}
-.badge{{display:inline-block;padding:2px 10px;border-radius:5px;font-size:11px;
-        font-weight:600;color:#fff;white-space:nowrap}}
-.card-info{{padding:0 16px 6px;font-size:12px;color:#666;display:flex;gap:12px}}
-.chart-box{{width:100%;height:200px}}
-.empty{{text-align:center;color:#999;padding:60px 20px;font-size:15px}}
-.legend{{display:flex;flex-wrap:wrap;gap:12px;padding:4px 24px 16px;font-size:12px;color:#666}}
-.legend-item{{display:flex;align-items:center;gap:4px}}
-.legend-dot{{width:10px;height:10px;border-radius:50%;display:inline-block}}
+.hint{{font-size:11px;color:#bbb;margin-left:auto}}
+#chart-container{{flex:1;min-height:0;padding:8px}}
 </style></head><body>
 <div class="header">
   <h1>ETF 信号时间线</h1>
-  <div class="meta">更新于 {ts} · 共 {n_etfs} 只 · {n_days} 个时间点(每日去重取最后一次)</div>
+  <div class="meta">更新于 {ts} · 共 {n_etfs} 只ETF · {n_days} 个时间点 · 每日去重取最后一次</div>
   <div class="toolbar">
-    <input type="text" id="search" placeholder="搜索 ETF 名称或代码...">
+    <input type="text" id="search" placeholder="搜索ETF, 回车高亮, 清空恢复全部...">
     <div class="filters" id="filters"></div>
+    <span class="hint">点击图例切换显示 | 搜索高亮特定ETF</span>
   </div>
 </div>
-<div class="legend" id="legend"></div>
-<div class="grid" id="grid"></div>
-<div class="empty" id="empty-msg" style="display:none">无匹配结果</div>
+<div id="chart-container"></div>
 
 <script>
 const DATA = {data_json};
 const CAT_COLOR = {cat_color_json};
 const CAT_LEVEL = {cat_level_json};
+const LEVEL_LABEL = {{0:'回避',1:'观望',2:'待确认',3:'持有/观察',4:'蚂蚁上树',5:'可关注',6:'回踩买'}};
 
-const LEVEL_LABEL = {{0:'回避',1:'观望',2:'待确认',3:'持有',4:'蚂蚁上树',5:'可关注',6:'回踩买'}};
-const ZONE_COLORS = [
-  {{min:0,max:1,color:'rgba(200,200,200,0.08)'}},
-  {{min:1,max:3,color:'rgba(255,152,0,0.06)'}},
-  {{min:3,max:6,color:'rgba(229,57,53,0.06)'}},
+const LINE_COLORS = [
+  '#e53935','#1e88e5','#43a047','#fb8c00','#8e24aa','#00acc1','#d81b60',
+  '#3949ab','#7cb342','#f4511e','#6d4c41','#546e7a','#c0ca33','#00897b',
+  '#5e35b1','#039be5','#c62828','#2e7d32','#ef6c00','#4527a0',
+  '#00838f','#ad1457','#283593','#558b2f','#bf360c','#4e342e',
+  '#37474f','#827717','#004d40','#311b92','#006064','#880e4f',
+  '#1a237e','#33691e','#e65100','#3e2723','#263238','#9e9d24',
+  '#00695c','#4a148c','#01579b','#b71c1c','#1b5e20','#e64a19','#455a64'
 ];
 
+let chart = null;
 let activeFilter = 'all';
-let charts = {{}};
+
+const allDates = [...new Set(DATA.flatMap(e => e.points.map(p => p.date)))].sort();
+
+function buildSeries() {{
+  return DATA.map((etf, i) => {{
+    const dataMap = {{}};
+    etf.points.forEach(p => {{ dataMap[p.date] = p; }});
+    const seriesData = allDates.map(d => {{
+      const p = dataMap[d];
+      if (!p) return null;
+      return {{
+        value: CAT_LEVEL[p.cat] ?? 1,
+        _detail: p
+      }};
+    }});
+    return {{
+      name: etf.name + ' ' + etf.code,
+      type: 'line',
+      data: seriesData,
+      symbol: 'circle',
+      symbolSize: 8,
+      connectNulls: true,
+      lineStyle: {{ width: 2 }},
+      itemStyle: {{ color: LINE_COLORS[i % LINE_COLORS.length] }},
+      emphasis: {{
+        focus: 'series',
+        lineStyle: {{ width: 4 }},
+        itemStyle: {{ borderWidth: 3, borderColor: '#fff', shadowBlur: 6, shadowColor: 'rgba(0,0,0,.3)' }}
+      }},
+      blur: {{ lineStyle: {{ opacity: 0.1 }}, itemStyle: {{ opacity: 0.1 }} }},
+    }};
+  }});
+}}
+
+function initChart() {{
+  const container = document.getElementById('chart-container');
+  chart = echarts.init(container);
+
+  const option = {{
+    grid: {{ top: 80, right: 30, bottom: 50, left: 70 }},
+    legend: {{
+      type: 'scroll',
+      top: 5,
+      left: 10, right: 10,
+      textStyle: {{ fontSize: 11 }},
+      pageIconSize: 12,
+      pageTextStyle: {{ fontSize: 11 }},
+      selector: [
+        {{ type: 'all', title: '全选' }},
+        {{ type: 'inverse', title: '反选' }}
+      ]
+    }},
+    tooltip: {{
+      trigger: 'item',
+      confine: true,
+      backgroundColor: 'rgba(255,255,255,0.98)',
+      borderColor: '#eee',
+      borderWidth: 1,
+      textStyle: {{ color: '#333', fontSize: 12 }},
+      extraCssText: 'max-width:380px;white-space:normal;line-height:1.7;box-shadow:0 4px 16px rgba(0,0,0,.15);border-radius:8px;padding:12px 14px',
+      formatter: function(params) {{
+        const p = params.data && params.data._detail;
+        if (!p) return params.seriesName;
+        const cc = CAT_COLOR[p.cat] || '#888';
+        const reasons = (p.reasons || []).join(' · ') || '—';
+        const verdict = p.verdict || '—';
+        return '<div>'
+          + '<div style="font-size:14px;font-weight:600;margin-bottom:6px">' + params.seriesName + '</div>'
+          + '<span style="color:#666">' + p.date + '</span>'
+          + ' · 大盘 <b>' + (p.market||'—') + '</b><br>'
+          + '<div style="border-top:1px solid #f0f0f0;margin:6px 0"></div>'
+          + '价格 <b style="font-size:16px">' + p.price + '</b>'
+          + '&nbsp;&nbsp;EMA34 ' + (p.ema34 || '—') + '<br>'
+          + '分类 <span style="display:inline-block;background:' + cc + ';color:#fff;padding:1px 8px;border-radius:4px;font-size:11px;font-weight:600">' + p.cat + '</span>'
+          + '&nbsp;&nbsp;打分 <b>' + p.score + '</b>&nbsp;&nbsp;位置 ' + p.pos + '%<br>'
+          + '月线 ' + (p.month_state||'—')
+          + ' · 周线 ' + (p.week_state||'—') + '<br>'
+          + '日线 ' + (p.day_state||'—') + ' (' + (p.day_cross||'—') + ')<br>'
+          + '<div style="border-top:1px solid #f0f0f0;margin:6px 0"></div>'
+          + '<div style="font-size:12px;color:#222;font-weight:500">' + verdict + '</div>'
+          + '<div style="font-size:11px;color:#999;margin-top:4px">' + reasons + '</div>'
+          + '</div>';
+      }}
+    }},
+    xAxis: {{
+      type: 'category',
+      data: allDates,
+      axisLabel: {{ fontSize: 11, color: '#888' }},
+      axisLine: {{ lineStyle: {{ color: '#ddd' }} }},
+      axisTick: {{ show: false }}
+    }},
+    yAxis: {{
+      type: 'value',
+      min: -0.3, max: 6.5,
+      interval: 1,
+      axisLabel: {{
+        fontSize: 11, color: '#888',
+        formatter: v => LEVEL_LABEL[v] || ''
+      }},
+      splitLine: {{ lineStyle: {{ color: '#f0f0f0' }} }},
+      axisLine: {{ show: false }},
+      axisTick: {{ show: false }}
+    }},
+    dataZoom: [
+      {{ type: 'inside', xAxisIndex: 0, filterMode: 'none' }},
+      {{ type: 'slider', xAxisIndex: 0, bottom: 8, height: 20, filterMode: 'none',
+         borderColor: '#ddd', fillerColor: 'rgba(24,144,255,0.15)' }}
+    ],
+    series: buildSeries()
+  }};
+  chart.setOption(option);
+
+  new ResizeObserver(() => chart.resize()).observe(container);
+}}
 
 function initFilters() {{
   const cats = ['all','可关注','持有/观察','观望','回避'];
@@ -168,187 +269,30 @@ function initFilters() {{
       document.querySelectorAll('.fbtn').forEach(b => b.classList.remove('active'));
       btn.classList.add('active');
       activeFilter = c;
-      applyFilters();
+      applyFilter();
     }};
     fBox.appendChild(btn);
   }});
 }}
 
-function initLegend() {{
-  const items = [
-    ['可关注-回踩','#e53935'],['可关注-金叉','#e53935'],['可关注-向上变盘','#e53935'],
-    ['可关注-蚂蚁上树','#ff5722'],['持有/观察','#fb8c00'],
-    ['观望-变盘待确认','#ff9800'],['观望','#888'],['回避','#bbb']
-  ];
-  const box = document.getElementById('legend');
-  items.forEach(([label, color]) => {{
-    box.innerHTML += `<span class="legend-item"><span class="legend-dot" style="background:${{color}}"></span>${{label}}</span>`;
-  }});
-}}
-
-function applyFilters() {{
+function applyFilter() {{
+  if (!chart) return;
   const q = document.getElementById('search').value.trim().toLowerCase();
-  let visible = 0;
+  const legend = {{}};
   DATA.forEach(etf => {{
-    const card = document.getElementById('card-' + etf.code);
-    if (!card) return;
+    const key = etf.name + ' ' + etf.code;
     const latest = etf.points[etf.points.length - 1];
     const matchQ = !q || etf.name.toLowerCase().includes(q) || etf.code.includes(q);
     const matchF = activeFilter === 'all' || latest.cat.startsWith(activeFilter);
-    const show = matchQ && matchF;
-    card.style.display = show ? '' : 'none';
-    if (show) {{
-      visible++;
-      if (charts[etf.code]) charts[etf.code].resize();
-    }}
+    legend[key] = matchQ && matchF;
   }});
-  document.getElementById('empty-msg').style.display = visible ? 'none' : '';
+  chart.setOption({{ legend: {{ selected: legend }} }});
 }}
 
-function renderCards() {{
-  const grid = document.getElementById('grid');
-  DATA.forEach(etf => {{
-    const latest = etf.points[etf.points.length - 1];
-    const catColor = CAT_COLOR[latest.cat] || '#888';
-    const card = document.createElement('div');
-    card.className = 'card';
-    card.id = 'card-' + etf.code;
-    card.innerHTML = `
-      <div class="card-head">
-        <div><div class="card-title">${{etf.name}}</div><div class="card-code">${{etf.code}}</div></div>
-        <span class="badge" style="background:${{catColor}}">${{latest.cat}}</span>
-      </div>
-      <div class="card-info">
-        <span>现价 ${{latest.price}}</span>
-        <span>打分 ${{latest.score}}</span>
-        <span>位置 ${{latest.pos}}%</span>
-        <span>EMA34 ${{latest.ema34 || '—'}}</span>
-      </div>
-      <div class="chart-box" id="chart-${{etf.code}}"></div>`;
-    grid.appendChild(card);
-  }});
-}}
-
-function initCharts() {{
-  const observer = new IntersectionObserver((entries) => {{
-    entries.forEach(entry => {{
-      if (entry.isIntersecting) {{
-        const code = entry.target.id.replace('chart-', '');
-        if (!charts[code]) {{
-          const etf = DATA.find(e => e.code === code);
-          if (etf) initSingleChart(etf);
-        }}
-        observer.unobserve(entry.target);
-      }}
-    }});
-  }}, {{ rootMargin: '200px' }});
-
-  DATA.forEach(etf => {{
-    const el = document.getElementById('chart-' + etf.code);
-    if (el) observer.observe(el);
-  }});
-}}
-
-function initSingleChart(etf) {{
-  const container = document.getElementById('chart-' + etf.code);
-  if (!container || container.offsetWidth === 0) return;
-  const chart = echarts.init(container);
-  charts[etf.code] = chart;
-
-  const dates = etf.points.map(p => p.date);
-  const levels = etf.points.map(p => CAT_LEVEL[p.cat] ?? 1);
-
-  const pieces = etf.points.map((p, i) => ({{
-    value: levels[i],
-    itemStyle: {{ color: CAT_COLOR[p.cat] || '#888' }}
-  }}));
-
-  const markAreas = [
-    [{{ yAxis: 4, itemStyle: {{ color: 'rgba(229,57,53,0.06)' }} }}, {{ yAxis: 6.5 }}],
-    [{{ yAxis: 2.5, itemStyle: {{ color: 'rgba(255,152,0,0.04)' }} }}, {{ yAxis: 4 }}],
-    [{{ yAxis: -0.5, itemStyle: {{ color: 'rgba(180,180,180,0.04)' }} }}, {{ yAxis: 2.5 }}],
-  ];
-
-  const option = {{
-    grid: {{ top: 15, right: 16, bottom: 28, left: 52 }},
-    xAxis: {{
-      type: 'category',
-      data: dates,
-      axisLabel: {{ fontSize: 10, color: '#999', rotate: dates.length > 10 ? 30 : 0 }},
-      axisLine: {{ lineStyle: {{ color: '#eee' }} }},
-      axisTick: {{ show: false }}
-    }},
-    yAxis: {{
-      type: 'value',
-      min: -0.3, max: 6.5,
-      interval: 1,
-      axisLabel: {{
-        fontSize: 9, color: '#aaa',
-        formatter: v => LEVEL_LABEL[v] || ''
-      }},
-      splitLine: {{ lineStyle: {{ color: '#f5f5f5' }} }},
-      axisLine: {{ show: false }},
-      axisTick: {{ show: false }}
-    }},
-    tooltip: {{
-      trigger: 'item',
-      confine: true,
-      backgroundColor: 'rgba(255,255,255,0.98)',
-      borderColor: '#eee',
-      borderWidth: 1,
-      textStyle: {{ color: '#333', fontSize: 12 }},
-      extraCssText: 'max-width:360px;white-space:normal;line-height:1.6;box-shadow:0 4px 16px rgba(0,0,0,.12)',
-      formatter: function(params) {{
-        const p = etf.points[params.dataIndex];
-        if (!p) return '';
-        const cc = CAT_COLOR[p.cat] || '#888';
-        const reasons = (p.reasons || []).join(' · ') || '—';
-        const verdict = p.verdict || '—';
-        return '<div style="font-size:13px">'
-          + '<b>' + etf.name + '</b> <span style="color:#aaa">' + etf.code + '</span><br>'
-          + '<span style="color:#666">' + p.date + '</span>'
-          + ' · 大盘 <b>' + (p.market||'—') + '</b><br>'
-          + '<div style="border-top:1px solid #f0f0f0;margin:5px 0"></div>'
-          + '价格 <b style="font-size:15px">' + p.price + '</b>'
-          + ' · EMA34 ' + (p.ema34 || '—') + '<br>'
-          + '分类 <b style="color:' + cc + '">' + p.cat + '</b>'
-          + ' · 打分 <b>' + p.score + '</b><br>'
-          + '月线 ' + (p.month_state||'—')
-          + ' · 周线 ' + (p.week_state||'—') + '<br>'
-          + '日线 ' + (p.day_state||'—') + ' (' + (p.day_cross||'—') + ')'
-          + ' · 位置 ' + p.pos + '%<br>'
-          + '<div style="border-top:1px solid #f0f0f0;margin:5px 0"></div>'
-          + '<div style="font-size:12px;color:#333">' + verdict + '</div>'
-          + '<div style="font-size:11px;color:#999;margin-top:4px">' + reasons + '</div>'
-          + '</div>';
-      }}
-    }},
-    series: [{{
-      type: 'line',
-      data: pieces,
-      symbol: 'circle',
-      symbolSize: etf.points.length === 1 ? 14 : 10,
-      lineStyle: {{ width: 2, color: '#ccc' }},
-      emphasis: {{
-        itemStyle: {{ borderWidth: 3, borderColor: '#fff', shadowBlur: 8, shadowColor: 'rgba(0,0,0,.2)' }}
-      }},
-      markArea: {{ silent: true, data: markAreas }},
-      animationDuration: 600
-    }}]
-  }};
-  chart.setOption(option);
-}}
-
-window.addEventListener('resize', () => {{
-  Object.values(charts).forEach(c => c.resize());
-}});
-
-document.getElementById('search').addEventListener('input', applyFilters);
+document.getElementById('search').addEventListener('input', applyFilter);
 
 initFilters();
-initLegend();
-renderCards();
-initCharts();
+initChart();
 </script></body></html>"""
 
 
