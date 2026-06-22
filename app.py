@@ -38,6 +38,8 @@ CAT_LEVEL = {
 }
 
 scan_state = {"running": False, "progress": 0, "total": 0, "message": ""}
+_timeline_snapshots = []
+_timeline_lock = threading.Lock()
 
 
 def _json_default(o):
@@ -104,6 +106,26 @@ def _build_chart_data(df, n=120):
 
 # ---------- Background scan ----------
 
+def _save_timeline_snapshot(results, market):
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    etfs = []
+    for r in results:
+        if r.get("error"):
+            continue
+        etfs.append({
+            "code": r["code"], "name": r["name"], "price": r.get("price"),
+            "cat": r.get("category", ""), "score": r.get("score", 0),
+            "pos": r.get("pos_pct"), "ema34": (r.get("ema_day") or {}).get("EMA34"),
+            "verdict": r.get("verdict", ""), "reasons": r.get("reasons", []),
+            "month_state": r.get("month_state", ""),
+            "week_state": r.get("week_state", ""),
+            "day_state": r.get("day_state", ""),
+            "day_cross": r.get("day_cross", ""),
+        })
+    snap = {"ts": ts, "market": market, "etfs": etfs}
+    with _timeline_lock:
+        _timeline_snapshots.append(snap)
+
 def _run_scan():
     global scan_state
     scan_state = {"running": True, "progress": 0, "total": 0, "message": "初始化..."}
@@ -134,6 +156,7 @@ def _run_scan():
             record_snapshot(results, market)
         except Exception:
             pass
+        _save_timeline_snapshot(results, market)
         scan_state["message"] = f"完成! {len(results)} 只"
     except Exception as e:
         scan_state["message"] = f"失败: {e}"
@@ -393,7 +416,42 @@ def api_scan_status():
 
 @app.route("/api/timeline")
 def api_timeline():
-    snapshots = load_snapshots()
+    snapshots = []
+    try:
+        snapshots = load_snapshots()
+    except Exception:
+        pass
+
+    with _timeline_lock:
+        snapshots = snapshots + list(_timeline_snapshots)
+
+    if not snapshots and SCAN_FILE.exists():
+        try:
+            data = json.loads(SCAN_FILE.read_text(encoding="utf-8"))
+            ts = data.get("ts", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            market = data.get("market", "")
+            etfs = []
+            for r in data.get("results", []):
+                if r.get("error"):
+                    continue
+                etfs.append({
+                    "code": r["code"], "name": r["name"], "price": r.get("price"),
+                    "cat": r.get("category", ""), "score": r.get("score", 0),
+                    "pos": r.get("pos_pct"), "ema34": (r.get("ema_day") or {}).get("EMA34"),
+                    "verdict": r.get("verdict", ""), "reasons": r.get("reasons", []),
+                    "month_state": r.get("month_state", ""),
+                    "week_state": r.get("week_state", ""),
+                    "day_state": r.get("day_state", ""),
+                    "day_cross": r.get("day_cross", ""),
+                })
+            if etfs:
+                snapshots.append({"ts": ts, "market": market, "etfs": etfs})
+        except Exception:
+            pass
+
+    if not snapshots:
+        return jsonify({"days": [], "etfs": [], "empty": True})
+
     by_day = {}
     for snap in snapshots:
         by_day[snap["ts"][:10]] = snap
@@ -833,6 +891,13 @@ let tlFilter = 'all';
 function loadTimeline() {
   fetch('/api/timeline').then(r=>r.json()).then(data => {
     tlData = data;
+    if (data.empty || !data.etfs || data.etfs.length === 0) {
+      document.getElementById('tl-meta').textContent = '';
+      document.getElementById('timeline-chart').innerHTML =
+        '<div style="text-align:center;padding:80px 20px;color:#888;font-size:16px">'
+        + '暂无时间线数据<br><span style="font-size:13px;color:#aaa">请先在「扫描报告」页点击「刷新全量扫描」生成数据</span></div>';
+      return;
+    }
     document.getElementById('tl-meta').textContent = data.etfs.length + ' 只ETF · ' + data.days.length + ' 个时间点';
     initTlFilters();
     renderTimeline();
