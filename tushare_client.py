@@ -179,6 +179,49 @@ class TushareMcpClient:
             df = self.apply_qfq(df, adj)
         return df
 
+    def fetch_stock_daily(
+        self,
+        code: str,
+        start_date: str,
+        end_date: str,
+        adjust: str = "qfq",
+    ) -> pd.DataFrame:
+        ts_code = to_ts_code(code)
+        rows: List[dict] = self.call_tool(
+            "daily",
+            {
+                "ts_code": ts_code,
+                "start_date": start_date,
+                "end_date": end_date,
+                "fields": ["trade_date", "open", "high", "low", "close", "vol"],
+            },
+        )
+        if not rows:
+            return pd.DataFrame()
+        df = pd.DataFrame(rows)
+        df = df.rename(columns={"trade_date": "date", "vol": "volume"})
+        df["date"] = pd.to_datetime(df["date"], format="%Y%m%d")
+        for col in ["open", "high", "low", "close", "volume"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = df.sort_values("date").dropna().reset_index(drop=True)
+        if adjust == "qfq":
+            adj_rows: List[dict] = self.call_tool(
+                "adj_factor",
+                {
+                    "ts_code": ts_code,
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "fields": ["trade_date", "adj_factor"],
+                },
+            )
+            if adj_rows:
+                adj = pd.DataFrame(adj_rows)
+                adj["date"] = pd.to_datetime(adj["trade_date"], format="%Y%m%d")
+                adj["adj_factor"] = pd.to_numeric(adj["adj_factor"], errors="coerce")
+                adj = adj[["date", "adj_factor"]].sort_values("date").dropna().reset_index(drop=True)
+                df = self.apply_qfq(df, adj)
+        return df
+
     def fetch_index_daily(
         self,
         ts_code: str,
