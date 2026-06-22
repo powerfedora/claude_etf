@@ -122,6 +122,7 @@ def _run_scan():
             try:
                 end = datetime.now().strftime("%Y%m%d")
                 df = client.fetch_fund_daily(code, START_DATE, end)
+                df, _ = _append_realtime_bar(df, code)
                 results.append(analyze_one(code, name, df, market))
             except Exception as e:
                 results.append({"code": code, "name": name, "error": str(e)})
@@ -208,6 +209,31 @@ def fetch_realtime(codes):
         return {}
 
 
+def _append_realtime_bar(df, code):
+    """用通达信实时行情补上 Tushare 缺失的最新交易日数据"""
+    import pandas as pd
+    live = fetch_realtime([code])
+    q = live.get(code)
+    if not q or not q["price"]:
+        return df, q
+    today = pd.Timestamp(datetime.now().date())
+    last_date = df["date"].iloc[-1] if not df.empty else pd.Timestamp("2000-01-01")
+    if today.weekday() >= 5:
+        return df, q
+    if today <= last_date:
+        return df, q
+    new_row = pd.DataFrame([{
+        "date": today,
+        "open": q["open"] if q["open"] else q["price"],
+        "high": q["high"] if q["high"] else q["price"],
+        "low": q["low"] if q["low"] else q["price"],
+        "close": q["price"],
+        "volume": q["volume"],
+    }])
+    df = pd.concat([df, new_row], ignore_index=True)
+    return df, q
+
+
 # ---------- API routes ----------
 
 @app.route("/")
@@ -290,12 +316,11 @@ def api_lookup():
             else client.fetch_fund_daily(code, START_DATE, end)
         if df is None or df.empty:
             return jsonify({"error": "数据为空, 请检查代码"})
+        df, q = _append_realtime_bar(df, code)
         result = analyze_one(code, name, df, market)
         result["_market"] = market
         result["_type"] = "个股" if _is_stock(code) else "ETF"
         chart = _build_chart_data(df)
-        live = fetch_realtime([code])
-        q = live.get(code)
         if q:
             result["live_price"] = q["price"]
             result["live_change"] = q["change_pct"]
