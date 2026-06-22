@@ -198,6 +198,10 @@ def _tdx_code(code):
     return "sz" + code
 
 
+def _is_etf_code(code):
+    return code.startswith(("51", "56", "15", "16", "58"))
+
+
 def _fetch_realtime_tdx(codes):
     client = _get_tdx_client()
     if client is None:
@@ -211,17 +215,31 @@ def _fetch_realtime_tdx(codes):
             records = records.records
         result = {}
         for rec in records:
-            raw_code = rec.code
+            raw_code = str(rec.code or "")
+            if len(raw_code) > 6:
+                raw_code = raw_code[-6:]
+            raw_code = raw_code.zfill(6)
             price = rec.last_price
             pre_close = rec.last_close_price if hasattr(rec, 'last_close_price') else (rec.pre_close_price if hasattr(rec, 'pre_close_price') else 0)
+            if not _is_etf_code(raw_code) and pre_close > 100:
+                price /= 10
+                pre_close /= 10
+                opn = rec.open_price / 10
+                high = rec.high_price / 10
+                low = rec.low_price / 10
+            else:
+                opn = rec.open_price
+                high = rec.high_price
+                low = rec.low_price
             change_pct = round((price - pre_close) / pre_close * 100, 2) if pre_close else 0
             result[raw_code] = {
                 "price": price,
-                "open": rec.open_price,
-                "high": rec.high_price,
-                "low": rec.low_price,
+                "open": opn,
+                "high": high,
+                "low": low,
                 "pre_close": pre_close,
-                "volume": rec.total_hand * 100 if hasattr(rec, 'total_hand') else 0,
+                # 与 Tushare K 线 vol 一致，单位为「手」(1手=100股)
+                "volume": rec.total_hand if hasattr(rec, 'total_hand') else 0,
                 "amount": rec.amount if hasattr(rec, 'amount') else 0,
                 "change_pct": change_pct,
             }
@@ -284,7 +302,7 @@ def _fetch_realtime_eastmoney(codes):
             opn = item.get("f17")
             opn = float(opn) / 100 if isinstance(opn, int) and opn else price
             vol = item.get("f5", 0)
-            vol = int(vol) * 100 if vol and vol != "-" else 0
+            vol = int(vol) if vol and vol != "-" else 0
             change_pct = item.get("f3")
             change_pct = float(change_pct) / 100 if isinstance(change_pct, int) else (float(change_pct) if change_pct and change_pct != "-" else 0)
             result[raw_code] = {
@@ -306,9 +324,14 @@ def fetch_realtime(codes):
     """批量获取实时行情, 优先通达信 TCP, 失败回退东方财富 HTTPS"""
     if not codes:
         return {}
-    result = _fetch_realtime_tdx(codes)
-    if not result:
-        result = _fetch_realtime_eastmoney(codes)
+    result = {}
+    uniq = list(dict.fromkeys(c.zfill(6) for c in codes))
+    for i in range(0, len(uniq), 40):
+        chunk = uniq[i:i + 40]
+        part = _fetch_realtime_tdx(chunk)
+        if not part:
+            part = _fetch_realtime_eastmoney(chunk)
+        result.update(part)
     return result
 
 
@@ -413,6 +436,25 @@ def _analyze_etf(code, name, client=None, market=None):
     df = client.fetch_fund_daily(code, START_DATE, end)
     df, _ = _append_realtime_bar(df, code)
     return analyze_one(code, name, df, market), market
+
+
+def _analyze_constituent(code, name, client, market):
+    """成份股信号分析: 优先 Tushare 日线, 失败时回退东方财富 K 线。"""
+    end = datetime.now().strftime("%Y%m%d")
+    try:
+        if _is_stock(code):
+            df = client.fetch_stock_daily(code, START_DATE, end)
+        else:
+            df = client.fetch_fund_daily(code, START_DATE, end)
+        if df is not None and len(df) >= 55:
+            df, _ = _append_realtime_bar(df, code)
+            return analyze_one(code, name, df, market)
+    except Exception:
+        pass
+    kdf = _fetch_kline_eastmoney(code, limit=200)
+    if kdf is not None and len(kdf) >= 55:
+        return analyze_one(code, name, kdf, market)
+    return None
 
 
 # ---------- API routes ----------
@@ -607,11 +649,27 @@ def api_suggest():
     return jsonify(results)
 
 
+def _lookup_name_by_code(code):
+    """按代码查名称, 优先本地 etf_list, 再查缓存的全量列表。"""
+    code = code.zfill(6)
+    try:
+        for c, n in _load_list():
+            if c == code:
+                return n
+    except Exception:
+        pass
+    for s in _load_stock_list():
+        if s["code"] == code:
+            return s["name"]
+    return None
+
+
 def _resolve_code(raw):
     """如果输入不是纯数字, 尝试通过名称/拼音匹配到股票代码"""
     raw = raw.strip()
     if raw.isdigit():
-        return raw.zfill(6), None
+        code = raw.zfill(6)
+        return code, _lookup_name_by_code(code)
     q = raw.lower()
     stocks = _load_stock_list()
     for s in stocks:
@@ -628,7 +686,10 @@ def api_lookup():
     raw_input = request.args.get("code", "").strip()
     name_input = request.args.get("name", "").strip()
     code, resolved_name = _resolve_code(raw_input)
-    name = name_input or resolved_name or code
+    if raw_input.isdigit():
+        name = resolved_name or code
+    else:
+        name = resolved_name or name_input or code
     if len(code) != 6 or not code.isdigit():
         return jsonify({"error": "未找到匹配的股票, 请输入6位代码或选择建议项"}), 400
 
@@ -658,6 +719,7 @@ def api_lookup():
 @app.route("/api/constituents")
 def api_constituents():
     code = request.args.get("code", "").strip().zfill(6)
+    quotes_only = request.args.get("refresh") == "1"
     if not code or len(code) != 6:
         return jsonify({"error": "无效代码"}), 400
 
@@ -666,7 +728,7 @@ def api_constituents():
         return jsonify({"stocks": [], "msg": "未找到成份股数据(基金季报持仓可能尚未披露)"})
 
     stock_codes = [s["code"] for s in stocks]
-    quotes = _fetch_realtime_eastmoney(stock_codes)
+    quotes = fetch_realtime(stock_codes)
     for s in stocks:
         q = quotes.get(s["code"], {})
         s["price"] = q.get("price", 0)
@@ -679,17 +741,39 @@ def api_constituents():
     for s in stocks:
         s["volume_ratio"] = vr_map.get(s["code"], 0)
 
+    if quotes_only:
+        return Response(
+            json.dumps({
+                "stocks": stocks,
+                "period": period,
+                "refreshed_at": datetime.now().strftime("%H:%M:%S"),
+            }, ensure_ascii=False, default=_json_default),
+            mimetype="application/json")
+
     try:
         client = TushareMcpClient()
         market = _get_market(client)
     except Exception:
+        client = None
         market = "未知"
 
+    scan_index, _, _ = _load_scan_index()
+
     for s in stocks:
+        scanned = scan_index.get(s["code"])
+        if scanned:
+            s["category"] = scanned.get("category", "—")
+            s["score"] = scanned.get("score", 0)
+            s["verdict"] = scanned.get("verdict", "")
+            continue
+        if client is None:
+            s["category"] = "—"
+            s["score"] = 0
+            s["verdict"] = "数据不可用"
+            continue
         try:
-            kdf = _fetch_kline_eastmoney(s["code"], limit=200)
-            if kdf is not None and len(kdf) >= 55:
-                result = analyze_one(s["code"], s["name"], kdf, market)
+            result = _analyze_constituent(s["code"], s["name"], client, market)
+            if result:
                 s["category"] = result.get("category", "—")
                 s["score"] = result.get("score", 0)
                 s["verdict"] = result.get("verdict", "")
@@ -701,9 +785,14 @@ def api_constituents():
             s["category"] = "—"
             s["score"] = 0
             s["verdict"] = ""
+        time.sleep(REQUEST_INTERVAL * 0.3)
 
     return Response(
-        json.dumps({"stocks": stocks, "period": period}, ensure_ascii=False, default=_json_default),
+        json.dumps({
+            "stocks": stocks,
+            "period": period,
+            "refreshed_at": datetime.now().strftime("%H:%M:%S"),
+        }, ensure_ascii=False, default=_json_default),
         mimetype="application/json")
 
 
@@ -904,6 +993,47 @@ def api_portfolio():
         mimetype="application/json")
 
 
+@app.route("/api/portfolio/import-screenshot", methods=["POST"])
+def api_portfolio_import_screenshot():
+    from portfolio_ops import save_import_image, apply_ocr_trades
+    from trade_ocr import ocr_and_parse
+
+    if "file" not in request.files:
+        return jsonify({"error": "请上传当日成交截图"}), 400
+    f = request.files["file"]
+    if not f.filename:
+        return jsonify({"error": "文件名为空"}), 400
+    ext = Path(f.filename).suffix.lower() or ".png"
+    if ext not in (".png", ".jpg", ".jpeg", ".webp", ".bmp"):
+        return jsonify({"error": "仅支持 png/jpg/jpeg/webp/bmp 图片"}), 400
+
+    data = f.read()
+    if len(data) > 12 * 1024 * 1024:
+        return jsonify({"error": "图片不能超过 12MB"}), 400
+
+    import_id, img_path = save_import_image(data, ext)
+    try:
+        trades, raw_lines = ocr_and_parse(str(img_path))
+    except Exception as e:
+        return jsonify({"error": f"OCR 识别失败: {e}"}), 400
+
+    if not trades:
+        return jsonify({
+            "error": "未能从截图中识别到成交记录, 请上传「当日成交」完整截图",
+            "ocr_preview": raw_lines[:40],
+        }), 400
+
+    result = apply_ocr_trades(trades, import_id=import_id, image_name=img_path.name)
+    result["ocr_preview"] = raw_lines[:40]
+    return jsonify(result)
+
+
+@app.route("/api/portfolio/trades")
+def api_portfolio_trades():
+    from portfolio_ops import list_all_trades
+    return jsonify({"trades": list_all_trades()})
+
+
 # ---------- Main HTML (SPA) ----------
 
 MAIN_HTML = """<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8">
@@ -927,6 +1057,19 @@ button{padding:8px 18px;border:none;border-radius:8px;font-size:13px;cursor:poin
 .btn-primary{background:#1890ff;color:#fff}
 .btn-primary:hover{background:#40a9ff}
 .btn-primary:disabled{background:#bbb;cursor:not-allowed}
+.pf-upload{border:2px dashed #d9d9d9;border-radius:12px;padding:28px 20px;text-align:center;background:#fafafa;cursor:pointer;transition:all .15s}
+.pf-upload:hover,.pf-upload.drag{border-color:#1890ff;background:#f0f7ff}
+.pf-upload input{display:none}
+.pf-upload-icon{font-size:32px;margin-bottom:8px}
+.pf-trade-table{width:100%;border-collapse:collapse;font-size:13px}
+.pf-trade-table th{background:#fafafa;padding:10px 12px;text-align:left;font-weight:600;color:#666;border-bottom:1px solid #eee;font-size:12px}
+.pf-trade-table td{padding:12px;border-bottom:1px solid #f0f0f0;vertical-align:middle}
+.pf-trade-table .sub{font-size:11px;color:#999;margin-top:2px}
+.pf-trade-table .buy{color:#e53935;font-weight:600}
+.pf-trade-table .sell{color:#43a047;font-weight:600}
+.pf-import-result{font-size:13px;margin-top:12px;padding:10px 12px;border-radius:8px;line-height:1.7}
+.pf-import-ok{background:#f6ffed;border:1px solid #b7eb8f;color:#389e0d}
+.pf-import-err{background:#fff2f0;border:1px solid #ffccc7;color:#cf1322}
 input[type=text]{padding:8px 14px;border:1px solid #ddd;border-radius:8px;font-size:14px;outline:none}
 input[type=text]:focus{border-color:#1890ff}
 table{width:100%;border-collapse:collapse}
@@ -941,7 +1084,7 @@ td{padding:10px;border-top:1px solid #f0f0f0;font-size:13px;vertical-align:top}
 .fbtn:hover{border-color:#1890ff;color:#1890ff}
 .fbtn.active{background:#1890ff;color:#fff;border-color:#1890ff}
 #lookup-input{width:220px}
-#lookup-chart{width:100%;height:480px}
+#lookup-chart{width:100%;height:560px}
 #lookup-wrap{display:flex;gap:16px;align-items:flex-start}
 #lookup-sidebar{width:200px;flex-shrink:0;position:sticky;top:70px}
 #lookup-main{flex:1;min-width:0}
@@ -1033,6 +1176,20 @@ td{padding:10px;border-top:1px solid #f0f0f0;font-size:13px;vertical-align:top}
     </div>
     <div class="meta" id="pf-summary"></div>
   </div>
+  <div class="card" id="pf-import-card" style="display:none">
+    <h2 style="margin:0 0 8px">📷 上传当日成交截图</h2>
+    <div class="meta">上传券商 App「当日成交」页面截图, 自动 OCR 识别并更新仓位/资金</div>
+    <label class="pf-upload" id="pf-upload-zone">
+      <input type="file" id="pf-screenshot" accept="image/png,image/jpeg,image/jpg,image/webp,image/bmp">
+      <div class="pf-upload-icon">📤</div>
+      <div>点击或拖拽截图到此处</div>
+      <div class="meta" style="margin-top:6px">支持 PNG / JPG, 建议截全「当日成交」列表</div>
+    </label>
+    <div style="display:flex;gap:8px;align-items:center;margin-top:10px">
+      <span class="meta" id="pf-import-status"></span>
+    </div>
+    <div id="pf-import-result" style="display:none"></div>
+  </div>
   <div class="card" id="pf-table-card" style="display:none">
     <div style="overflow-x:auto">
       <table>
@@ -1044,13 +1201,15 @@ td{padding:10px;border-top:1px solid #f0f0f0;font-size:13px;vertical-align:top}
         <tbody id="pf-body"></tbody>
       </table>
     </div>
-    <div class="meta" style="margin-top:8px">止损位取当日日线 EMA34, 每次刷新自动更新; 跌破并转死叉再离场。"已建仓/成交均价(cost)/状态" 在 portfolio.json 中维护。</div>
+    <div class="meta" style="margin-top:8px">止损位取当日日线 EMA34, 每次刷新自动更新。仓位通过上方截图导入自动更新。</div>
   </div>
   <div class="card" id="pf-trades-card" style="display:none">
-    <h2 id="pf-trades-title">操作记录</h2>
+    <h2 id="pf-trades-title">📜 当日成交记录</h2>
     <div style="overflow-x:auto">
-      <table>
-        <thead><tr><th>时间</th><th>标的</th><th>方向</th><th>金额</th><th>成交价</th><th>后:已建仓/均价</th><th>备注</th></tr></thead>
+      <table class="pf-trade-table">
+        <thead><tr>
+          <th>时间</th><th>名称/代码</th><th>价格/数量</th><th>方向/金额</th>
+        </tr></thead>
         <tbody id="pf-trades-body"></tbody>
       </table>
     </div>
@@ -1097,7 +1256,10 @@ td{padding:10px;border-top:1px solid #f0f0f0;font-size:13px;vertical-align:top}
         <div class="card" id="constituents-card" style="display:none">
           <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:12px">
             <h2 style="margin:0">成份股明细</h2>
-            <span class="meta" id="const-meta"></span>
+            <div style="display:flex;align-items:center;gap:8px">
+              <span class="meta" id="const-meta"></span>
+              <button class="btn-primary" id="btn-const-refresh" onclick="refreshConstituents()" style="display:none;padding:6px 14px;font-size:12px">刷新行情</button>
+            </div>
           </div>
           <div style="overflow-x:auto">
             <table id="constituents-table">
@@ -1388,10 +1550,105 @@ document.getElementById('tl-search').addEventListener('input', applyTlFilter);
 
 // ============ Portfolio ============
 let pfLoaded = false;
+
+function renderTradeRows(trades) {
+  const tbody = document.getElementById('pf-trades-body');
+  if (!trades || !trades.length) {
+    tbody.innerHTML = '<tr><td colspan="4" class="meta" style="text-align:center;padding:24px">暂无成交记录, 上传截图后自动录入</td></tr>';
+    document.getElementById('pf-trades-title').textContent = '📜 当日成交记录';
+    return;
+  }
+  document.getElementById('pf-trades-title').textContent = '📜 成交记录 (' + trades.length + ' 笔)';
+  tbody.innerHTML = trades.map(t => {
+    const dirCls = t.action === 'sell' ? 'sell' : 'buy';
+    const date = t.date || (t.ts||'').slice(0,10);
+    const time = t.time || (t.ts||'').slice(11,19);
+    return '<tr>'
+      +'<td><div>'+date+'</div><div class="sub">'+time+'</div></td>'
+      +'<td><div><b>'+t.name+'</b></div><div class="sub">'+t.code+'</div></td>'
+      +'<td><div>'+(Number(t.price)||0).toFixed(3)+'</div><div class="sub">'+(t.qty||'—')+'</div></td>'
+      +'<td><div class="'+dirCls+'">'+(t.direction||(t.action==='sell'?'证券卖出':'证券买入'))+'</div>'
+      +'<div class="sub">'+(Number(t.amount)||0).toFixed(3)+'</div></td>'
+      +'</tr>';
+  }).join('');
+}
+
+function loadTradeHistory() {
+  fetch('/api/portfolio/trades').then(r=>r.json()).then(d => {
+    renderTradeRows(d.trades||[]);
+    document.getElementById('pf-trades-card').style.display = '';
+  }).catch(()=>{
+    renderTradeRows([]);
+    document.getElementById('pf-trades-card').style.display = '';
+  });
+}
+
+function uploadScreenshot(file) {
+  if (!file) return;
+  const st = document.getElementById('pf-import-status');
+  const res = document.getElementById('pf-import-result');
+  st.innerHTML = '<span class="spin"></span> OCR 识别中...';
+  res.style.display = 'none';
+  const fd = new FormData();
+  fd.append('file', file);
+  fetch('/api/portfolio/import-screenshot', {method:'POST', body:fd})
+    .then(async r => {
+      const text = await r.text();
+      let d;
+      try { d = JSON.parse(text); } catch (_) {
+        throw new Error(r.status === 500 ? '服务器错误, 请稍后重试' : ('响应异常: ' + text.slice(0, 80)));
+      }
+      return {ok:r.ok, d};
+    })
+    .then(({ok,d}) => {
+      st.textContent = '';
+      res.style.display = '';
+      if (!ok) {
+        res.className = 'pf-import-result pf-import-err';
+        res.innerHTML = '❌ ' + (d.error||'识别失败')
+          + (d.ocr_preview ? '<br><span class="meta">OCR 预览: '+d.ocr_preview.slice(0,12).join(' · ')+'...</span>' : '');
+        return;
+      }
+      let html = '✅ 识别 <b>'+d.parsed_count+'</b> 笔';
+      const nNew = (d.applied||[]).length;
+      const nSkip = (d.skipped||[]).length;
+      if (nNew) html += ', 新录入 <b>'+nNew+'</b> 笔';
+      else html += ', 新录入 <b>0</b> 笔';
+      if (nSkip) html += ', 跳过重复 <b>'+nSkip+'</b> 笔';
+      if (d.summary) {
+        html += '<br>已投 <b>'+(d.summary.filled/10000)+'万</b> · 现金 <b>'+(d.summary.cash/10000)+'万</b>';
+      }
+      if (d.errors && d.errors.length) html += '<br><span style="color:#cf1322">'+d.errors.join('<br>')+'</span>';
+      res.className = 'pf-import-result pf-import-ok';
+      res.innerHTML = html;
+      document.getElementById('pf-screenshot').value = '';
+      loadPortfolio();
+    }).catch(e => {
+      st.textContent = '';
+      res.style.display = '';
+      res.className = 'pf-import-result pf-import-err';
+      res.innerHTML = '❌ '+e;
+    });
+}
+
+(function initPfUpload(){
+  const zone = document.getElementById('pf-upload-zone');
+  const input = document.getElementById('pf-screenshot');
+  if (!zone || !input) return;
+  input.onchange = () => uploadScreenshot(input.files[0]);
+  zone.ondragover = e => { e.preventDefault(); zone.classList.add('drag'); };
+  zone.ondragleave = () => zone.classList.remove('drag');
+  zone.ondrop = e => {
+    e.preventDefault(); zone.classList.remove('drag');
+    if (e.dataTransfer.files.length) uploadScreenshot(e.dataTransfer.files[0]);
+  };
+})();
+
 function loadPortfolio() {
   document.getElementById('pf-loading').innerHTML = '<span class="spin"></span>加载组合数据...';
   document.getElementById('pf-table-card').style.display = 'none';
   document.getElementById('pf-trades-card').style.display = 'none';
+  document.getElementById('pf-import-card').style.display = 'none';
   fetch('/api/portfolio').then(r=>r.json()).then(d => {
     if (d.error) { document.getElementById('pf-loading').textContent = '❌ '+d.error; return; }
     pfLoaded = true;
@@ -1440,26 +1697,8 @@ function loadPortfolio() {
       +'<td style="font-size:12px">子弹: 回踩加仓/防守</td></tr>';
     document.getElementById('pf-body').innerHTML = tbody;
     document.getElementById('pf-table-card').style.display = '';
-
-    // Trades
-    if (d.trades && d.trades.length) {
-      document.getElementById('pf-trades-title').textContent = '📜 操作记录 ('+d.trades.length+' 笔)';
-      let trows = '';
-      d.trades.forEach(t => {
-        const actColor = t.action==='sell'?'#e53935':'#43a047';
-        const actLabel = t.action==='sell'?'卖出':'买入';
-        trows += '<tr>'
-          +'<td class="meta">'+t.ts+'</td>'
-          +'<td><b>'+t.name+'</b> <span class="meta">'+t.code+'</span></td>'
-          +'<td style="color:'+actColor+';font-weight:600">'+actLabel+'</td>'
-          +'<td>'+wan(t.amount)+'</td>'
-          +'<td>'+t.price+'</td>'
-          +'<td>'+wan(t.after_filled)+'/'+t.after_cost+'</td>'
-          +'<td class="meta">'+t.note+'</td></tr>';
-      });
-      document.getElementById('pf-trades-body').innerHTML = trows;
-      document.getElementById('pf-trades-card').style.display = '';
-    }
+    document.getElementById('pf-import-card').style.display = '';
+    loadTradeHistory();
   }).catch(e => {
     document.getElementById('pf-loading').textContent = '❌ 加载失败: '+e;
   });
@@ -1508,6 +1747,7 @@ function pickSuggestion(code, name) {
 }
 
 inputEl.addEventListener('input', () => {
+  document.getElementById('lookup-name').value = '';
   const q = inputEl.value.trim();
   if (q.length < 1) { suggestEl.classList.remove('show'); return; }
   if (/^\\d{6}$/.test(q)) { suggestEl.classList.remove('show'); return; }
@@ -1576,21 +1816,27 @@ document.getElementById('history-clear').onclick = () => {
 
 function doLookup() {
   const code = document.getElementById('lookup-input').value.trim();
-  const name = document.getElementById('lookup-name').value.trim() || code;
   if (!code) return;
+  const nameEl = document.getElementById('lookup-name');
+  const isCode = /^\\d{6}$/.test(code);
+  if (isCode) nameEl.value = '';
+  const name = nameEl.value.trim();
   activeCode = code;
   document.getElementById('btn-lookup').disabled = true;
   document.getElementById('lookup-status').innerHTML = '<span class="spin"></span>查询中...';
   document.getElementById('lookup-result').style.display = 'none';
 
-  fetch('/api/lookup?code='+encodeURIComponent(code)+'&name='+encodeURIComponent(name))
+  let url = '/api/lookup?code=' + encodeURIComponent(code);
+  if (name && !isCode) url += '&name=' + encodeURIComponent(name);
+  fetch(url)
     .then(r=>r.json()).then(data => {
       document.getElementById('btn-lookup').disabled = false;
       if (data.error) { document.getElementById('lookup-status').textContent = '❌ '+data.error; return; }
       document.getElementById('lookup-status').textContent = '';
       document.getElementById('lookup-result').style.display = '';
       const r = data.result;
-      addHistory(r.code, r.name||name, r.category||'');
+      document.getElementById('lookup-name').value = r.name || code;
+      addHistory(r.code, r.name||code, r.category||'');
       renderLookup(r, data.chart);
     }).catch(e => {
       document.getElementById('btn-lookup').disabled = false;
@@ -1632,19 +1878,37 @@ function renderLookup(r, chart) {
   document.getElementById('lookup-detail').innerHTML = rows.map(([k,v])=>
     '<tr><td style="color:#888;white-space:nowrap;width:130px">'+k+'</td><td>'+v+'</td></tr>').join('');
 
-  // K-line chart
+  // K-line chart + volume
   const dates = chart.map(r=>r.date);
-  const ohlc = chart.map(r=>[r.open,r.close,r.low,r.high]);
   const upC='#e53935', dnC='#2196f3';
+  const ohlc = chart.map(r=>[r.open,r.close,r.low,r.high]);
+  const volData = chart.map(r=>({
+    value: r.volume||0,
+    itemStyle: { color: (r.close>=r.open) ? upC : dnC }
+  }));
+  const fmtVol = v => {
+    if (v >= 1e8) return (v/1e8).toFixed(1)+'亿';
+    if (v >= 1e4) return (v/1e4).toFixed(0)+'万';
+    return v;
+  };
 
   const el1 = document.getElementById('lookup-chart');
   if (!lookupMainChart) lookupMainChart = echarts.init(el1);
 
   lookupMainChart.setOption({
     animation:false,
-    grid:{left:60,right:20,top:20,bottom:30},
-    xAxis:{type:'category',data:dates,boundaryGap:true,axisLabel:{fontSize:11,color:'#888'},axisLine:{lineStyle:{color:'#ddd'}}},
-    yAxis:{scale:true,splitLine:{lineStyle:{color:'#f0f0f0'}},axisLabel:{fontSize:11,color:'#888'}},
+    grid:[
+      {left:60,right:20,top:20,height:'58%'},
+      {left:60,right:20,top:'74%',height:'16%'}
+    ],
+    xAxis:[
+      {type:'category',data:dates,boundaryGap:true,gridIndex:0,axisLabel:{show:false},axisLine:{lineStyle:{color:'#ddd'}},axisTick:{show:false}},
+      {type:'category',data:dates,boundaryGap:true,gridIndex:1,axisLabel:{fontSize:11,color:'#888'},axisLine:{lineStyle:{color:'#ddd'}}}
+    ],
+    yAxis:[
+      {scale:true,gridIndex:0,splitLine:{lineStyle:{color:'#f0f0f0'}},axisLabel:{fontSize:11,color:'#888'}},
+      {gridIndex:1,splitNumber:2,splitLine:{show:false},axisLabel:{fontSize:10,color:'#888',formatter:fmtVol}}
+    ],
     tooltip:{
       trigger:'axis',axisPointer:{type:'cross'},
       backgroundColor:'rgba(255,255,255,.96)',borderColor:'#eee',borderWidth:1,
@@ -1653,44 +1917,77 @@ function renderLookup(r, chart) {
         let s='<b>'+params[0].axisValue+'</b><br>';
         params.forEach(p=>{
           if(p.seriesType==='candlestick'){const v=p.data;s+='开 '+v[1]+' 收 '+v[2]+'<br>低 '+v[3]+' 高 '+v[4]+'<br>';}
-          else s+='<span style="color:'+p.color+'">●</span> '+p.seriesName+': <b>'+p.data+'</b><br>';
+          else if(p.seriesName==='成交量'){s+='成交量 <b>'+fmtVol(p.data.value||p.data)+'</b><br>';}
+          else if(p.seriesType==='line'){s+='<span style="color:'+p.color+'">●</span> '+p.seriesName+': <b>'+p.data+'</b><br>';}
         });
         return s;
       }
     },
-    dataZoom:[{type:'inside',xAxisIndex:[0],start:0,end:100}],
+    axisPointer:{link:[{xAxisIndex:[0,1]}]},
+    dataZoom:[{type:'inside',xAxisIndex:[0,1],start:0,end:100}],
     series:[
-      {type:'candlestick',data:ohlc,itemStyle:{color:upC,color0:dnC,borderColor:upC,borderColor0:dnC}},
-      {name:'EMA13',type:'line',data:chart.map(r=>r.ema13),symbol:'none',lineStyle:{width:1.5,color:'#1e88e5'},z:5},
-      {name:'EMA34',type:'line',data:chart.map(r=>r.ema34),symbol:'none',lineStyle:{width:2,color:'#ff9800'},z:5},
-      {name:'EMA55',type:'line',data:chart.map(r=>r.ema55),symbol:'none',lineStyle:{width:1.5,color:'#66bb6a'},z:5},
+      {type:'candlestick',xAxisIndex:0,yAxisIndex:0,data:ohlc,itemStyle:{color:upC,color0:dnC,borderColor:upC,borderColor0:dnC}},
+      {name:'EMA13',type:'line',xAxisIndex:0,yAxisIndex:0,data:chart.map(r=>r.ema13),symbol:'none',lineStyle:{width:1.5,color:'#1e88e5'},z:5},
+      {name:'EMA34',type:'line',xAxisIndex:0,yAxisIndex:0,data:chart.map(r=>r.ema34),symbol:'none',lineStyle:{width:2,color:'#ff9800'},z:5},
+      {name:'EMA55',type:'line',xAxisIndex:0,yAxisIndex:0,data:chart.map(r=>r.ema55),symbol:'none',lineStyle:{width:1.5,color:'#66bb6a'},z:5},
+      {name:'成交量',type:'bar',xAxisIndex:1,yAxisIndex:1,data:volData,barMaxWidth:12}
     ]
   }, true);
   setTimeout(()=>{lookupMainChart.resize();},100);
 
   // Load constituents for ETF
   if (r._type === 'ETF') {
-    document.getElementById('constituents-card').style.display = '';
-    document.getElementById('const-meta').innerHTML = '<span class="spin"></span>加载成份股...';
-    document.getElementById('const-body').innerHTML = '';
-    fetch('/api/constituents?code='+encodeURIComponent(r.code))
-      .then(res=>res.json()).then(d => {
-        if (d.stocks && d.stocks.length) {
-          constData = d.stocks;
-          constSortKey = 'change'; constSortAsc = false;
-          constData.sort((a,b) => (b.change||0) - (a.change||0));
-          document.getElementById('const-meta').textContent = (d.period ? d.period + ' · ' : '') + d.stocks.length + ' 只成份股';
-          renderConstTable();
-        } else {
-          document.getElementById('const-meta').textContent = d.msg || '未找到成份股';
-        }
-      }).catch(()=>{ document.getElementById('const-meta').textContent = '加载失败'; });
+    loadConstituents(r.code, false);
   } else {
     document.getElementById('constituents-card').style.display = 'none';
+    constEtfCode = '';
   }
 }
 
 let constData = [], constSortKey = 'change', constSortAsc = false;
+let constEtfCode = '', constPeriod = '';
+
+function loadConstituents(code, refresh) {
+  constEtfCode = code;
+  document.getElementById('constituents-card').style.display = '';
+  document.getElementById('btn-const-refresh').style.display = '';
+  document.getElementById('const-meta').innerHTML = '<span class="spin"></span>' + (refresh ? '刷新行情中...' : '加载成份股(含信号分析, 请稍候)...');
+  if (!refresh) document.getElementById('const-body').innerHTML = '';
+  const url = '/api/constituents?code=' + encodeURIComponent(code) + (refresh ? '&refresh=1' : '');
+  fetch(url).then(res=>res.json()).then(d => {
+    if (d.stocks && d.stocks.length) {
+      if (refresh && constData.length) {
+        const qmap = {};
+        d.stocks.forEach(s => { qmap[s.code] = s; });
+        constData.forEach(s => {
+          const q = qmap[s.code];
+          if (q) {
+            s.price = q.price;
+            s.change = q.change;
+            s.volume = q.volume;
+            s.volume_ratio = q.volume_ratio;
+          }
+        });
+      } else {
+        constData = d.stocks;
+        constSortKey = 'change'; constSortAsc = false;
+        constData.sort((a,b) => (b.change||0) - (a.change||0));
+      }
+      constPeriod = d.period || constPeriod;
+      document.getElementById('const-meta').textContent =
+        (constPeriod ? constPeriod + ' · ' : '') + constData.length + ' 只成份股'
+        + (d.refreshed_at ? ' · 行情 ' + d.refreshed_at : '');
+      renderConstTable();
+    } else {
+      document.getElementById('const-meta').textContent = d.msg || '未找到成份股';
+    }
+  }).catch(()=>{ document.getElementById('const-meta').textContent = '加载失败'; });
+}
+
+function refreshConstituents() {
+  if (!constEtfCode) return;
+  loadConstituents(constEtfCode, true);
+}
 
 function sortConst(key) {
   if (constSortKey === key) constSortAsc = !constSortAsc;
@@ -1709,7 +2006,7 @@ function renderConstTable() {
     const cc = CAT_COLOR[s.category]||'#ccc';
     const chgColor = s.change > 0 ? '#e53935' : (s.change < 0 ? '#2196f3' : '#333');
     const chgSign = s.change > 0 ? '+' : '';
-    return '<tr style="cursor:pointer" onclick="document.getElementById(\\'lookup-input\\').value=\\''+s.code+'\\';doLookup()">'
+    return '<tr style="cursor:pointer" onclick="document.getElementById(\\'lookup-input\\').value=\\''+s.code+'\\';document.getElementById(\\'lookup-name\\').value=\\'\\';doLookup()">'
       +'<td>'+s.name+'</td>'
       +'<td class="meta">'+s.code+'</td>'
       +'<td style="text-align:right;font-weight:600">'+((s.price||0).toFixed(2))+'</td>'

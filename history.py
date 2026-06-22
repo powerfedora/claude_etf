@@ -89,10 +89,11 @@ def record_snapshot(results, market_state):
     return ts
 
 
-def log_trade(code, action, amount, price, name=None, note=""):
+def log_trade(code, action, amount, price, name=None, note="", status=None,
+              trade_time=None, qty=0, direction="", import_id=None):
     """记一笔操作并同步更新 portfolio.json。action: buy/sell。amount=金额(元), price=成交价。"""
     amount = float(amount); price = float(price)
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    ts = trade_time or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     pf = json.loads(PORTFOLIO_FILE.read_text(encoding="utf-8")) if PORTFOLIO_FILE.exists() \
         else {"capital": 0, "positions": []}
@@ -105,10 +106,17 @@ def log_trade(code, action, amount, price, name=None, note=""):
     old_filled = pos.get("filled", 0) or 0
     old_cost = pos.get("cost", 0) or 0
     if action == "buy":
-        old_shares = (old_filled / old_cost) if old_cost else 0
+        if price <= 0:
+            raise ValueError("成交价须大于 0")
+        if amount <= 0:
+            raise ValueError("成交金额须大于 0")
+        if old_filled > 0 and old_cost <= 0:
+            old_shares = old_filled / price
+        else:
+            old_shares = (old_filled / old_cost) if old_cost > 0 else 0
         new_shares = old_shares + amount / price
         new_filled = old_filled + amount
-        pos["cost"] = round(new_filled / new_shares, 4) if new_shares else price
+        pos["cost"] = round(new_filled / new_shares, 4) if new_shares > 0 else price
         pos["filled"] = round(new_filled)
     elif action == "sell":
         new_filled = max(0, old_filled - amount)
@@ -116,13 +124,18 @@ def log_trade(code, action, amount, price, name=None, note=""):
         if new_filled == 0:
             pos["cost"] = 0
     else:
-        sys.exit(f"未知操作: {action} (应为 buy 或 sell)")
+        raise ValueError(f"未知操作: {action} (应为 buy 或 sell)")
+
+    if status:
+        pos["status"] = status
 
     pf["as_of"] = ts[:10]
     PORTFOLIO_FILE.write_text(json.dumps(pf, ensure_ascii=False, indent=2), encoding="utf-8")
 
     rec = {"ts": ts, "code": code, "name": pos.get("name"), "action": action,
-           "amount": amount, "price": price, "note": note,
+           "amount": amount, "price": price, "qty": int(qty or 0),
+           "direction": direction or ("证券买入" if action == "buy" else "证券卖出"),
+           "note": note, "import_id": import_id or "",
            "after_filled": pos["filled"], "after_cost": pos.get("cost", 0)}
     _append(TRADES_FILE, rec)
     return rec

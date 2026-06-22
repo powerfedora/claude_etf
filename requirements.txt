@@ -3,4 +3,6 @@ pandas
 requests
 eltdx
 gunicorn
+pytesseract
+Pillow
 pypinyin
