@@ -65,6 +65,12 @@ def record_snapshot(results, market_state):
             "code": r["code"], "name": r["name"], "price": r["price"],
             "cat": r["category"], "score": r["score"], "pos": r["pos_pct"],
             "ema34": (r.get("ema_day") or {}).get("EMA34"),
+            "verdict": r.get("verdict", ""),
+            "reasons": r.get("reasons", []),
+            "month_state": r.get("month_state", ""),
+            "week_state": r.get("week_state", ""),
+            "day_state": r.get("day_state", ""),
+            "day_cross": r.get("day_cross", ""),
         })
     pf_state = None
     if PORTFOLIO_FILE.exists():

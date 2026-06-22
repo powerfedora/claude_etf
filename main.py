@@ -144,6 +144,13 @@ def main():
     if snap_ts:
         print(f"已存快照: {snap_ts}")
 
+    try:
+        from timeline import build_timeline
+        tl_path = build_timeline()
+        print(f"时间线: {tl_path}")
+    except Exception as e:
+        print(f"[时间线生成失败] {e}")
+
     # 自动发布到公开 GitHub Pages 仓库 (见 push.py); 未配置或失败都不影响扫描结果
     try:
         from push import publish_latest
