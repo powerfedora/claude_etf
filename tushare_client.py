@@ -49,7 +49,6 @@ class TushareMcpClient:
         self.mcp_url = mcp_url or load_mcp_url()
         self.session = requests.Session()
         self.session.trust_env = False
-        self.session.verify = False
         self._req_id = 0
 
     def call_tool(self, name: str, arguments: Optional[Dict[str, Any]] = None) -> Any:
