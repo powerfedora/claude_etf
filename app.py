@@ -139,6 +139,74 @@ def _run_scan():
         scan_state["running"] = False
 
 
+# ---------- 实时行情 (通达信协议, 通过 eltdx 库连接) ----------
+
+_tdx_client = None
+_tdx_lock = threading.Lock()
+
+
+def _get_tdx_client():
+    global _tdx_client
+    if _tdx_client is not None:
+        return _tdx_client
+    with _tdx_lock:
+        if _tdx_client is not None:
+            return _tdx_client
+        try:
+            from eltdx import TdxClient
+            c = TdxClient(timeout=8.0, probe_hosts=True, probe_timeout=1.5)
+            c.connect()
+            _tdx_client = c
+        except Exception:
+            _tdx_client = None
+    return _tdx_client
+
+
+def _tdx_code(code):
+    code = code.zfill(6)
+    if code.startswith(("5", "6", "9")):
+        return "sh" + code
+    return "sz" + code
+
+
+def fetch_realtime(codes):
+    """批量获取实时行情 (通达信协议), 返回 {code: {price, change_pct, ...}}"""
+    if not codes:
+        return {}
+    client = _get_tdx_client()
+    if client is None:
+        return {}
+    try:
+        tdx_codes = [_tdx_code(c) for c in codes]
+        records = client.get_quote(tdx_codes)
+        if not records:
+            return {}
+        if hasattr(records, 'records'):
+            records = records.records
+        result = {}
+        for rec in records:
+            raw_code = rec.code
+            price = rec.last_price
+            pre_close = rec.last_close_price if hasattr(rec, 'last_close_price') else (rec.pre_close_price if hasattr(rec, 'pre_close_price') else 0)
+            change_pct = round((price - pre_close) / pre_close * 100, 2) if pre_close else 0
+            result[raw_code] = {
+                "price": price,
+                "open": rec.open_price,
+                "high": rec.high_price,
+                "low": rec.low_price,
+                "pre_close": pre_close,
+                "volume": rec.total_hand * 100 if hasattr(rec, 'total_hand') else 0,
+                "amount": rec.amount if hasattr(rec, 'amount') else 0,
+                "change_pct": change_pct,
+                "time": "",
+            }
+        return result
+    except Exception:
+        global _tdx_client
+        _tdx_client = None
+        return {}
+
+
 # ---------- API routes ----------
 
 @app.route("/")
@@ -150,6 +218,15 @@ def index():
 def api_report():
     if SCAN_FILE.exists():
         data = json.loads(SCAN_FILE.read_text(encoding="utf-8"))
+        codes = [r["code"] for r in data.get("results", []) if not r.get("error")]
+        live = fetch_realtime(codes)
+        if live:
+            for r in data["results"]:
+                q = live.get(r.get("code", ""))
+                if q:
+                    r["live_price"] = q["price"]
+                    r["live_change"] = q["change_pct"]
+            data["has_live"] = True
         return jsonify(data)
     return jsonify({"ts": None, "market": None, "results": []})
 
@@ -216,6 +293,11 @@ def api_lookup():
         result["_market"] = market
         result["_type"] = "个股" if _is_stock(code) else "ETF"
         chart = _build_chart_data(df)
+        live = fetch_realtime([code])
+        q = live.get(code)
+        if q:
+            result["live_price"] = q["price"]
+            result["live_change"] = q["change_pct"]
         return Response(
             json.dumps({"result": result, "chart": chart}, ensure_ascii=False, default=_json_default),
             mimetype="application/json")
@@ -295,7 +377,7 @@ td{padding:10px;border-top:1px solid #f0f0f0;font-size:13px;vertical-align:top}
   <div class="card" id="report-focus"></div>
   <div class="card" style="padding:0;overflow-x:auto">
     <table id="report-table">
-      <thead><tr><th>标的</th><th>现价</th><th>分类 / 打分</th><th>月/周/日</th><th>位置</th><th>结论 / 信号</th></tr></thead>
+      <thead><tr><th>标的</th><th>实时价格</th><th>分类 / 打分</th><th>月/周/日</th><th>位置</th><th>结论 / 信号</th></tr></thead>
       <tbody id="report-body"></tbody>
     </table>
   </div>
@@ -403,8 +485,15 @@ function loadReport() {
     tbody.innerHTML = rows.map(r => {
       const c = CAT_COLOR[r.category]||'#888';
       const reasons = (r.reasons||[]).join(' · ') || '—';
+      let priceHtml = '<span style="font-weight:600;font-size:15px">'+r.price+'</span>';
+      if (r.live_price) {
+        const lc = r.live_change >= 0 ? '#e53935' : '#2196f3';
+        priceHtml = '<span style="font-weight:700;font-size:16px;color:'+lc+'">'+r.live_price.toFixed(3)+'</span>'
+          +'<br><span style="font-size:11px;color:'+lc+'">'+(r.live_change>=0?'+':'')+r.live_change+'%</span>'
+          +'<br><span class="meta">昨收 '+r.price+'</span>';
+      }
       return '<tr style="border-left:4px solid '+c+'"><td><b>'+r.name+'</b><br><span class="meta">'+r.code+'</span></td>'
-        +'<td style="font-weight:600;font-size:15px">'+r.price+'</td>'
+        +'<td>'+priceHtml+'</td>'
         +'<td><span class="badge" style="background:'+c+'">'+r.category+'</span><br><span class="meta">打分 '+r.score+'</span></td>'
         +'<td class="meta" style="line-height:1.6">月:'+r.month_state+'<br>周:'+r.week_state+'<br>日:'+r.day_state+' ('+r.day_cross+')</td>'
         +'<td class="meta">'+(r.pos_pct||'—')+'%</td>'
@@ -586,7 +675,11 @@ function renderLookup(r, chart) {
     +'<div class="meta">大盘 '+(r._market||'—')+'</div></div>'
     +'<span class="badge" style="background:'+cc+';font-size:13px;padding:4px 14px">'+r.category+'</span></div>'
     +'<div style="margin-top:12px;font-size:15px">'
-    +'打分 <b>'+r.score+'</b>&nbsp;&nbsp;现价 <b style="font-size:18px">'+r.price+'</b>&nbsp;&nbsp;位置 '+r.pos_pct+'%</div>'
+    +'打分 <b>'+r.score+'</b>&nbsp;&nbsp;'
+    +(r.live_price
+      ? (function(){var lc=r.live_change>=0?'#e53935':'#2196f3'; return '实时 <b style="font-size:18px;color:'+lc+'">'+r.live_price.toFixed(3)+'</b> <span style="font-size:12px;color:'+lc+'">'+(r.live_change>=0?'+':'')+r.live_change+'%</span>&nbsp;&nbsp;昨收 '+r.price;})()
+      : '现价 <b style="font-size:18px">'+r.price+'</b>')
+    +'&nbsp;&nbsp;位置 '+r.pos_pct+'%</div>'
     +'<div style="margin-top:10px;padding:10px 14px;background:#fafafa;border-radius:8px;border-left:4px solid '+cc+';font-size:13px;line-height:1.7">'+r.verdict+'</div>';
 
   const ema = r.ema_day||{};
