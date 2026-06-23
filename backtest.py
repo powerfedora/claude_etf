@@ -308,6 +308,135 @@ def daily_signal(d_all, w_all, m_all, market_state):
 
 STICK_COOLDOWN = 10  # 改进: 粘合止损后冷却期(交易日)
 
+
+def simulate_strategy_trades(etf_df, idx_df, start_pos=130, end_pos=None, improved=False, close_at_end=False):
+    """逐日模拟策略买卖, 返回 [{type, date, price, reason, ...}, ...]"""
+    if idx_df is None or idx_df.empty:
+        return []
+    if end_pos is None:
+        end_pos = len(etf_df) - 1
+    if start_pos > end_pos or len(etf_df) <= start_pos:
+        return []
+
+    cash = CAPITAL
+    shares = 0
+    cost_price = 0.0
+    max_profit_pct = 0.0
+    trades = []
+    holding = False
+    pending_stick_buy = False
+    stick_cooldown = 0
+    last_cat = ""
+
+    for pos in range(start_pos, end_pos + 1):
+        row = etf_df.iloc[pos]
+        today = row["date"]
+        price = row["close"]
+
+        d_slice = add_emas(etf_df.iloc[: pos + 1])
+        w_slice = add_emas(resample_weekly(etf_df.iloc[: pos + 1]))
+        m_slice = add_emas(resample_monthly(etf_df.iloc[: pos + 1]))
+
+        idx_mask = idx_df["date"] <= today
+        idx_pos = idx_mask.sum() - 1
+        market = get_market_state_at(idx_df, idx_pos) if idx_pos >= 10 else "谨慎档"
+
+        cat, score, verdict = daily_signal(d_slice, w_slice, m_slice, market)
+        last_cat = cat
+
+        if improved and stick_cooldown > 0:
+            stick_cooldown -= 1
+
+        if improved and pending_stick_buy and not holding:
+            is_still_stick, still_dir, _ = detect_stick(d_slice)
+            ema34_now = d_slice.iloc[-1][f"ema{EMA_MID}"]
+            if price > ema34_now and (not is_still_stick or still_dir != "向下"):
+                shares = int(cash // price)
+                if shares > 0:
+                    cost_price = price
+                    cash -= shares * price
+                    max_profit_pct = 0
+                    holding = True
+                    trades.append({
+                        "type": "buy",
+                        "date": today.strftime("%Y-%m-%d"),
+                        "price": round(price, 4),
+                        "reason": "粘合突破(次日确认)",
+                        "category": "可关注-向上变盘",
+                    })
+            pending_stick_buy = False
+            if holding:
+                continue
+
+        if holding:
+            pnl_pct = (price - cost_price) / cost_price
+            max_profit_pct = max(max_profit_pct, pnl_pct)
+            sell_reason = None
+
+            if cat == "回避":
+                sell_reason = "周线方向闸失败"
+            elif cat == "回避-向下变盘":
+                sell_reason = "粘合向下跌破"
+            elif price < d_slice.iloc[-1][f"ema{EMA_MID}"]:
+                sell_reason = f"跌破EMA34({d_slice.iloc[-1][f'ema{EMA_MID}']:.4f})"
+            elif max_profit_pct >= PROFIT_TRAIL and pnl_pct < 0.03:
+                sell_reason = f"移动止盈(最高浮盈{max_profit_pct*100:.1f}%回落)"
+
+            if sell_reason:
+                if improved and trades and "向上变盘" in trades[-1].get("category", ""):
+                    stick_cooldown = STICK_COOLDOWN
+                cash += shares * price
+                trades.append({
+                    "type": "sell",
+                    "date": today.strftime("%Y-%m-%d"),
+                    "price": round(price, 4),
+                    "reason": sell_reason,
+                    "category": cat,
+                })
+                shares = 0
+                cost_price = 0
+                max_profit_pct = 0
+                holding = False
+
+        elif not holding and cat.startswith("可关注"):
+            is_stick_signal = "向上变盘" in cat
+            if improved and is_stick_signal:
+                if stick_cooldown > 0:
+                    continue
+                vol_now = d_slice.iloc[-1]["volume"]
+                vol_ma = d_slice["volume"].iloc[-VOL_LOOKBACK - 1:-1].mean()
+                if vol_now <= vol_ma:
+                    continue
+                pending_stick_buy = True
+                continue
+
+            shares = int(cash // price)
+            if shares > 0:
+                cost_price = price
+                cash -= shares * price
+                max_profit_pct = 0
+                holding = True
+                trades.append({
+                    "type": "buy",
+                    "date": today.strftime("%Y-%m-%d"),
+                    "price": round(price, 4),
+                    "reason": verdict,
+                    "category": cat,
+                })
+
+    if close_at_end and holding:
+        last_price = etf_df.iloc[end_pos]["close"]
+        trades.append({
+            "type": "sell",
+            "date": etf_df.iloc[end_pos]["date"].strftime("%Y-%m-%d"),
+            "price": round(last_price, 4),
+            "reason": "回测结束平仓",
+            "category": last_cat,
+        })
+
+    return trades
+
+
 def run_backtest(code="510210", name=None, idx_df=None, quiet=False, improved=False):
     """回测单只ETF。improved=True 启用3项改进: 次日确认/放量过滤/冷却期。"""
     ts_code = code.zfill(6)
